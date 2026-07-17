@@ -13,7 +13,7 @@ st.sidebar.header("⚙️ 시간표 제약 조건 설정")
 
 # A. 기본 설정
 st.sidebar.subheader("1. 기본 규칙")
-max_consecutive = st.sidebar.slider("최대 허용 연속 수업 (연강)", min_value=1, max_value=4, value=2)
+max_consecutive = st.sidebar.slider("최대 허용 연속 수업 (연강)", min_value=1, max_value=4, value=2, help="정규 교과는 예외 없이 이 기준을 엄수합니다.")
 target_1st_free = st.sidebar.slider("1교시 평균 공강 횟수 (주당)", min_value=0, max_value=5, value=2)
 apply_sports_rule = st.sidebar.checkbox("운동장 체육 2학급 이하 제한", value=True)
 
@@ -25,7 +25,6 @@ default_banned = """[개인별 금지 조건]
 김연지: 월/금 전체, 화/수/목 5,6,7 금지
 이기영: 월1, 목1, 금5 금지
 김효진: 1교시 전체 금지
-강영미: 화/수/목 3교시 금지
 김온유: 화6 금지
 
 [무용(이연경) 및 특별실 제약]
@@ -64,10 +63,11 @@ st.header("📂 시수표 업로드 및 실행")
 uploaded_excel = st.file_uploader("전체 시수 취합 엑셀 (.xlsx)", type=["xlsx"])
 
 if uploaded_excel is not None:
-    st.success("✅ 파일 업로드 완료! '시간표 생성 시작' 버튼을 눌러주세요.")
+    st.success("✅ 파일 업로드 완료!")
     
     if st.button("🚀 시간표 생성 시작", use_container_width=True):
-        with st.spinner("AI 최적화 엔진이 수만 가지 경우의 수를 계산 중입니다... (약 1~3분 소요)"):
+        # AI 최적화 특성상 % 표기가 어려움을 안내하는 스피너
+        with st.spinner("AI가 수백만 개의 경우의 수를 탐색 중입니다. 진행률(%) 표기는 어렵지만 열심히 계산하고 있습니다! (약 1~3분 소요)"):
             
             user_conditions = {
                 "max_consecutive": max_consecutive,
@@ -79,9 +79,10 @@ if uploaded_excel is not None:
             
             if status == "성공" and excel_buffer is not None:
                 st.success("🎉 모든 조건을 만족하는 미배정 0 시간표가 완성되었습니다!")
+                st.info("🖨️ 다운로드 후 엑셀에서 인쇄(Ctrl+P)를 누르시면 A4 한 장에 딱 맞게 출력됩니다.")
                 st.balloons()
                 st.download_button(
-                    label="📥 학교 양식 엑셀로 다운로드 (교사별/반별)",
+                    label="📥 학교 공식 양식 엑셀 다운로드 (정렬 & 인쇄 최적화)",
                     data=excel_buffer,
                     file_name="2026-2학기_최종시간표_초안.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
