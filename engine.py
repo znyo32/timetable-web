@@ -6,6 +6,15 @@ from openpyxl.styles import Alignment, Font, Border, Side
 from openpyxl.utils import get_column_letter
 from ortools.sat.python import cp_model
 
+# 화면의 텍스트("월1, 수2")를 파이썬 슬롯 코드로 변환해주는 똑똑한 함수
+def parse_slots(s_str):
+    s_str = s_str.strip()
+    if len(s_str) == 1 and s_str in ["월", "화", "수", "목", "금"]:
+        return [(s_str, p) for p in range(1, 8)]
+    elif len(s_str) >= 2:
+        return [(s_str[0], int(s_str[1:]))]
+    return []
+
 def run_timetable_engine(uploaded_file, user_conditions):
     xls = pd.ExcelFile(uploaded_file)
     target_sheet = xls.sheet_names[0]
@@ -51,67 +60,50 @@ def run_timetable_engine(uploaded_file, user_conditions):
     slots = [(d, p) for d in DAYS for p in range(1, GRID[d] + 1)]
     S = len(slots); sidx = {s: i for i, s in enumerate(slots)}
 
-    def match_slots(day=None, days=None, period=None, periods=None):
-        out = []
-        for i, (d, p) in enumerate(slots):
-            if day and d != day: continue
-            if days and d not in days: continue
-            if period and p != period: continue
-            if periods and p not in periods: continue
-            out.append(i)
-        return out
-
-    # ==== 1. 기본 금지 조건 ====
-    reserved = set()
-    for i in match_slots(day="월", period=7):
-        for g, b in classes: reserved.add((g, b, i)) 
-
     ban = defaultdict(set)
-    for i in match_slots(days=["월", "금"]): ban["김연지"].add(i)
-    for i in match_slots(days=["화", "수", "목"], periods=[5,6,7]): ban["김연지"].add(i)
-    for i in match_slots(day="월", period=1): ban["이기영"].add(i)
-    for i in match_slots(day="목", period=1): ban["이기영"].add(i)
-    for i in match_slots(day="금", period=5): ban["이기영"].add(i)
-    for i in match_slots(period=1): ban["김효진"].add(i)
-    for i in match_slots(day="화", period=6): ban["김온유"].add(i)
+    reserved = set()
+    for i in [sidx[(d, p)] for d, p in slots if d=="월" and p==7]:
+        for g, b in classes: reserved.add((g, b, i)) # 창체 고정
 
-    bujang = ["이기영","김영순","이준희","박수경","서정수","김진호","이연경","임주헌","전정화","김나영","배미래","오은정"]
-    for i in match_slots(day="금", period=6):
-        for t in bujang: ban[t].add(i)
+    # UI 텍스트 동적 파싱 (개인별 금지)
+    for line in user_conditions.get("banned_text", "").split("\n"):
+        if ":" in line:
+            t, slots_part = line.split(":", 1)
+            t = t.strip()
+            for s in slots_part.split(","):
+                for d, p in parse_slots(s):
+                    if (d, p) in sidx: ban[t].add(sidx[(d, p)])
 
-    # ==== 2. 스포츠 및 지원강사 압핀 고정 ====
+    # UI 텍스트 동적 파싱 (부장 공강)
+    if user_conditions.get("opt_bujang_free", True):
+        bujang = [x.strip() for x in user_conditions.get("bujang_text", "").split(",") if x.strip()]
+        for t in bujang:
+            if ("금", 6) in sidx: ban[t].add(sidx[("금", 6)])
+
+    # UI 텍스트 동적 파싱 (하드 고정)
     fixed_slots = []
-    sports_pins = {
-        ("화", 2): [("김진호", (3,1)), ("서정수", (3,1)), ("류지영", (3,2)), ("제현진", (3,3))],
-        ("화", 3): [("황두환", (3,4)), ("김영순", (3,4)), ("김승미", (3,5)), ("이아정", (3,6))],
-        ("화", 4): [("김재수", (3,7)), ("김진호", (3,7)), ("류지영", (3,8))],
-        ("수", 2): [("김재수", (1,1)), ("김영순", (1,1)), ("김영혜", (1,2)), ("이아정", (1,3))],
-        ("수", 3): [("김진호", (1,4)), ("임주헌", (1,4)), ("김승미", (1,5)), ("류지영", (1,6))],
-        ("수", 4): [("서정수", (1,7)), ("김영순", (1,7)), ("제현진", (1,8))],
-        ("목", 2): [("김재수", (2,1)), ("임주헌", (2,1)), ("김승미", (2,2)), ("김영혜", (2,3))],
-        ("목", 3): [("김진호", (2,4)), ("김영순", (2,4)), ("류지영", (2,5)), ("이아정", (2,6))],
-        ("목", 4): [("황두환", (2,7)), ("김승미", (2,7)), ("제현진", (2,8))]
-    }
     sports_slot_indices = set()
-    for (d, p), mappings in sports_pins.items():
-        slot_idx = sidx[(d, p)]
-        sports_slot_indices.add(slot_idx)
-        for t_name, cls_tuple in mappings:
-            ban[t_name].add(slot_idx)
-            fixed_slots.append({"teacher": t_name, "cls": cls_tuple, "slot": slot_idx, "subj": "스포츠"})
-
-    for d, p in [("화", 1), ("화", 2), ("화", 3), ("화", 4)]:
-        slot_idx = sidx[(d, p)]
-        ban["류명현"].add(slot_idx)
-        fixed_slots.append({"teacher": "류명현", "cls": None, "slot": slot_idx, "subj": "지원"})
-    for d, p in [("월", 2), ("월", 3), ("금", 2), ("금", 3)]:
-        slot_idx = sidx[(d, p)]
-        ban["영어지원"].add(slot_idx)
-        fixed_slots.append({"teacher": "영어지원", "cls": None, "slot": slot_idx, "subj": "지원"})
-    for d, p in [("금", 1), ("금", 3), ("금", 4)]:
-        slot_idx = sidx[(d, p)]
-        ban["이기영"].add(slot_idx)
-        fixed_slots.append({"teacher": "이기영", "cls": None, "slot": slot_idx, "subj": "지원"})
+    for line in user_conditions.get("pins_text", "").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("["): continue
+        if "(" in line and "):" in line:
+            cls_part, rest = line.split("(", 1)
+            slot_part, teachers_part = rest.split("):", 1)
+            cls_part, slot_part = cls_part.strip(), slot_part.strip()
+            if len(slot_part) >= 2 and (slot_part[0], int(slot_part[1:])) in sidx:
+                slot_i = sidx[(slot_part[0], int(slot_part[1:]))]
+                if "-" in cls_part:
+                    sports_slot_indices.add(slot_i)
+                    g, b = map(int, cls_part.split("-"))
+                    cls_tuple = (g, b)
+                    subj_name = "스포츠"
+                else:
+                    cls_tuple = None
+                    subj_name = "지원"
+                for t in teachers_part.split(","):
+                    t = t.strip()
+                    ban[t].add(slot_i)
+                    fixed_slots.append({"teacher": t, "cls": cls_tuple, "slot": slot_i, "subj": subj_name})
 
     m = cp_model.CpModel()
     xc = {(ci, i): m.NewBoolVar(f"c{ci}_{i}") for ci in range(len(common_classes)) for i in range(S)}
@@ -125,10 +117,13 @@ def run_timetable_engine(uploaded_file, user_conditions):
             tocc[(t, i)] = o
         for i in range(S): m.Add(tocc[(t, i)] <= 1)
 
-    # ==== 3. 특별실 공유 (김연지-임주헌 엇갈리게 배정) ====
-    if "김연지" in teachers and "임주헌" in teachers:
-        for i in range(S):
-            m.Add(tocc[("김연지", i)] + tocc[("임주헌", i)] <= 1)
+    # UI 텍스트 동적 파싱 (특별실 공유)
+    sp_teachers = [x.strip() for x in user_conditions.get("special_room_text", "").split(",") if x.strip()]
+    if len(sp_teachers) >= 2:
+        t1, t2 = sp_teachers[0], sp_teachers[1]
+        if t1 in teachers and t2 in teachers:
+            for i in range(S):
+                m.Add(tocc[(t1, i)] + tocc[(t2, i)] <= 1)
 
     for ci, u in enumerate(common_classes):
         g, b = u["grade"], u["cls"]; t = u["teacher"]
@@ -151,17 +146,28 @@ def run_timetable_engine(uploaded_file, user_conditions):
     for (cls, t), idxs in byc.items():
         if len(idxs) >= 2:
             for d in DAYS:
-                m.Add(sum(xc[(ci, i)] for ci in idxs for i in match_slots(day=d)) <= 1)
+                target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1)]
+                m.Add(sum(xc[(ci, i)] for ci in idxs for i in target_slots) <= 1)
 
-    # ==== 4. 무용 및 체육 제약 ====
-    for ci, u in enumerate(common_classes):
-        if u["teacher"] == "이연경":
-            if u["grade"] == 3:
-                for i in match_slots(day="화"): m.Add(xc[(ci, i)] == 0)
-            elif u["grade"] == 2:
-                for i in match_slots(day="목"): m.Add(xc[(ci, i)] == 0)
+    # UI 텍스트 동적 파싱 (특정 학년 요일 금지 - 무용)
+    for line in user_conditions.get("grade_day_text", "").split("\n"):
+        if ":" in line:
+            t, rule_part = line.split(":", 1)
+            t = t.strip()
+            for rule in rule_part.split(","):
+                if "-" in rule:
+                    g_str, day_str = rule.split("-", 1)
+                    try:
+                        g_val = int(g_str.strip())
+                        day_str = day_str.strip()
+                        for ci, u in enumerate(common_classes):
+                            if u["teacher"] == t and u["grade"] == g_val:
+                                target_slots = [sidx[(day_str, p)] for p in range(1, GRID[day_str] + 1)]
+                                for i in target_slots: m.Add(xc[(ci, i)] == 0)
+                    except: pass
 
-    if user_conditions.get("apply_sports_rule", True):
+    # 체육 운동장 2학급 제한
+    if user_conditions.get("opt_sports_limit", True):
         for i in sports_slot_indices:
             pe_in_slot = []
             for ci, u in enumerate(common_classes):
@@ -169,14 +175,15 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     pe_in_slot.append(xc[(ci, i)])
             m.Add(sum(pe_in_slot) <= 2)
 
-    # 3학년 미술 블록타임 및 일반과목 분산
+    # UI 텍스트 동적 파싱 (블록타임 적용)
+    block_teachers = [x.strip() for x in user_conditions.get("block_text", "").split(",") if x.strip()]
     for ci, u in enumerate(common_classes):
-        is_art_block = (u["subj"] == "미술" and u["grade"] == 3 and u["teacher"] in ["김진호", "이정빈"])
-        if is_art_block and u["hours"] == 2:
+        is_art_block = (u["teacher"] in block_teachers and u["hours"] == 2)
+        if is_art_block:
             block_vars = []
             for d in DAYS:
                 for p in range(1, GRID[d]):
-                    if p == 4: continue
+                    if p == 4: continue # 점심시간 가로지르기 방지
                     b_var = m.NewBoolVar(f"block_{ci}_{d}_{p}")
                     block_vars.append((b_var, sidx[(d, p)], sidx[(d, p+1)]))
             m.AddExactlyOne([bv[0] for bv in block_vars])
@@ -185,22 +192,30 @@ def run_timetable_engine(uploaded_file, user_conditions):
         else:
             if u["hours"] <= 5:
                 for d in DAYS:
-                    m.Add(sum(xc[(ci, i)] for i in match_slots(day=d)) <= 1)
+                    target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1)]
+                    m.Add(sum(xc[(ci, i)] for i in target_slots) <= 1)
 
-    # ==== 5. 필수 배정 조건 ====
-    pjh = [ci for ci, u in enumerate(common_classes) if u["teacher"] == "박주현"]
-    if pjh:
-        m.Add(sum(xc[(ci, i)] for ci in pjh for i in match_slots(day="월", periods=[2,3])) >= 1)
-        m.Add(sum(xc[(ci, i)] for ci in pjh for i in match_slots(day="금", periods=[2,3])) >= 1)
+    # UI 텍스트 동적 파싱 (필수 배정)
+    if user_conditions.get("opt_mandatory_check", True):
+        for line in user_conditions.get("mandatory_text", "").split("\n"):
+            if ":" in line and ">=" in line:
+                left, req = line.rsplit(">=", 1)
+                t, slots_part = left.split(":", 1)
+                t, req = t.strip(), int(req.strip())
+                target_slots = []
+                for s in slots_part.split(","):
+                    for d, p in parse_slots(s):
+                        if (d, p) in sidx: target_slots.append(sidx[(d, p)])
+                cidx_t = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t]
+                if cidx_t and target_slots:
+                    m.Add(sum(xc[(ci, i)] for ci in cidx_t for i in target_slots) >= req)
 
-    ljh = [ci for ci, u in enumerate(common_classes) if u["teacher"] == "이준희"]
-    if ljh: m.Add(sum(xc[(ci, i)] for ci in ljh for i in match_slots(day="화", periods=[1,2,3,4])) >= 2)
-
-    # ==== 6. 3연강 절대 금지 (지원강사 제외 모두 엄수) ====
+    # 3연강 금지 처리 (UI 연동)
     user_max_c = user_conditions.get("max_consecutive", 2)
+    support_teachers = [x.strip() for x in user_conditions.get("support_text", "").split(",") if x.strip()]
     for t in teachers:
-        if t in ["류명현", "체육지원", "영어지원"]: 
-            continue # 고정표 상 연속 배정된 지원강사만 예외
+        if t in support_teachers: 
+            continue # 지원강사는 연강 제한 예외
         for d in DAYS:
             for p in range(1, GRID[d] + 1):
                 if all((d, p + k) in sidx for k in range(user_max_c + 1)):
@@ -211,59 +226,64 @@ def run_timetable_engine(uploaded_file, user_conditions):
                         slot_vars.append(1 if is_fixed else tocc[(t, s_idx)])
                     m.Add(sum(slot_vars) <= user_max_c)
 
-    # ==== 7. 균등 배정 로직 (Soft Constraint) ====
+    # ==== 7. 차순위 균등 배정 로직 ====
     pen = []
-    target_1st_free = user_conditions.get("target_1st_free", 2)
-    target_1st_work = 5 - target_1st_free
-    for t in teachers:
-        s_1 = sum(tocc[(t, i)] for i in match_slots(period=1))
-        fixed_p1 = sum(1 for f in fixed_slots if f["teacher"] == t and slots[f["slot"]][1] == 1)
-        diff = m.NewIntVar(-5, 5, "")
-        m.Add(diff == (s_1 + fixed_p1) - target_1st_work)
-        abs_diff = m.NewIntVar(0, 5, "")
-        m.AddAbsEquality(abs_diff, diff)
-        pen.append((2, abs_diff))
-
-    for t in teachers:
-        day_sums = []
-        for d in DAYS:
-            s_d = sum(tocc[(t, i)] for i in match_slots(day=d))
-            fixed_d = sum(1 for f in fixed_slots if f["teacher"] == t and slots[f["slot"]][0] == d)
-            day_sums.append(s_d + fixed_d)
-        d_max = m.NewIntVar(0, 7, ""); d_min = m.NewIntVar(0, 7, "")
-        m.AddMaxEquality(d_max, day_sums); m.AddMinEquality(d_min, day_sums)
-        pen.append((10, d_max - d_min))
-
-    hr_1 = ["이아정","김홍섭","김나영","김온유","류지영","박주현","임희우","최나경"]
-    hr_2 = ["우가윤","이상수","배미래","박은영","오성환","박은경","오혜빈","강수정"]
-    hr_3 = ["우지연","김명규","오은정","서예슬","김영혜","이정빈","김승미","허수정"]
-    hr_all = set(hr_1 + hr_2 + hr_3)
-    hr_others = [t for t in teachers if t not in hr_all]
-
-    def balance_group(group_teachers, weight):
-        valid_t = [t for t in group_teachers if t in teachers]
-        if not valid_t: return
-        p3_sums = []
-        for t in valid_t:
-            s_3 = sum(tocc[(t, i)] for i in match_slots(period=3))
-            fixed_p3 = sum(1 for f in fixed_slots if f["teacher"] == t and slots[f["slot"]][1] == 3)
-            p3_sums.append(s_3 + fixed_p3)
-        g_max = m.NewIntVar(0, 5, ""); g_min = m.NewIntVar(0, 5, "")
-        m.AddMaxEquality(g_max, p3_sums); m.AddMinEquality(g_min, p3_sums)
-        pen.append((weight, g_max - g_min))
-
-    balance_group(hr_1, 5); balance_group(hr_2, 5); balance_group(hr_3, 5); balance_group(hr_others, 2)
-
-    for t in ["김진호", "이정빈"]:
-        cidx_3 = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t and u["subj"] == "미술" and u["grade"] == 3]
-        if cidx_3:
-            am = sum(xc[(ci, i)] for ci in cidx_3 for i in match_slots(periods=[1,2,3,4]))
-            pm = sum(xc[(ci, i)] for ci in cidx_3 for i in match_slots(periods=[5,6,7]))
-            diff = m.NewIntVar(-10, 10, "")
-            m.Add(diff == am - pm)
-            abs_diff = m.NewIntVar(0, 10, "")
+    
+    if user_conditions.get("opt_1st_class", True):
+        target_1st_free = user_conditions.get("target_1st_free", 2)
+        target_1st_work = 5 - target_1st_free
+        for t in teachers:
+            s_1 = sum(tocc[(t, sidx[(d, 1)])] for d in DAYS if (d, 1) in sidx)
+            fixed_p1 = sum(1 for f in fixed_slots if f["teacher"] == t and slots[f["slot"]][1] == 1)
+            diff = m.NewIntVar(-5, 5, "")
+            m.Add(diff == (s_1 + fixed_p1) - target_1st_work)
+            abs_diff = m.NewIntVar(0, 5, "")
             m.AddAbsEquality(abs_diff, diff)
-            pen.append((20, abs_diff))
+            pen.append((2, abs_diff))
+
+    if user_conditions.get("opt_day_balance", True):
+        for t in teachers:
+            day_sums = []
+            for d in DAYS:
+                s_d = sum(tocc[(t, sidx[(d, p)])] for p in range(1, GRID[d] + 1))
+                fixed_d = sum(1 for f in fixed_slots if f["teacher"] == t and slots[f["slot"]][0] == d)
+                day_sums.append(s_d + fixed_d)
+            d_max = m.NewIntVar(0, 7, ""); d_min = m.NewIntVar(0, 7, "")
+            m.AddMaxEquality(d_max, day_sums); m.AddMinEquality(d_min, day_sums)
+            pen.append((10, d_max - d_min))
+
+    if user_conditions.get("opt_hr_balance", True):
+        hr_1 = [x.strip() for x in user_conditions.get("hr1_text", "").split(",") if x.strip()]
+        hr_2 = [x.strip() for x in user_conditions.get("hr2_text", "").split(",") if x.strip()]
+        hr_3 = [x.strip() for x in user_conditions.get("hr3_text", "").split(",") if x.strip()]
+        hr_all = set(hr_1 + hr_2 + hr_3)
+        hr_others = [t for t in teachers if t not in hr_all]
+
+        def balance_group(group_teachers, weight):
+            valid_t = [t for t in group_teachers if t in teachers]
+            if not valid_t: return
+            p3_sums = []
+            for t in valid_t:
+                s_3 = sum(tocc[(t, sidx[(d, 3)])] for d in DAYS if (d, 3) in sidx)
+                fixed_p3 = sum(1 for f in fixed_slots if f["teacher"] == t and slots[f["slot"]][1] == 3)
+                p3_sums.append(s_3 + fixed_p3)
+            g_max = m.NewIntVar(0, 5, ""); g_min = m.NewIntVar(0, 5, "")
+            m.AddMaxEquality(g_max, p3_sums); m.AddMinEquality(g_min, p3_sums)
+            pen.append((weight, g_max - g_min))
+
+        balance_group(hr_1, 5); balance_group(hr_2, 5); balance_group(hr_3, 5); balance_group(hr_others, 2)
+
+    if user_conditions.get("opt_block_balance", True):
+        for t in block_teachers:
+            cidx_3 = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t and u["hours"] == 2]
+            if cidx_3:
+                am = sum(xc[(ci, sidx[(d, p)])] for ci in cidx_3 for d in DAYS for p in range(1, 5) if (d, p) in sidx)
+                pm = sum(xc[(ci, sidx[(d, p)])] for ci in cidx_3 for d in DAYS for p in range(5, 8) if (d, p) in sidx)
+                diff = m.NewIntVar(-10, 10, "")
+                m.Add(diff == am - pm)
+                abs_diff = m.NewIntVar(0, 10, "")
+                m.AddAbsEquality(abs_diff, diff)
+                pen.append((20, abs_diff))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 180
@@ -271,7 +291,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
     m.Minimize(sum(w * v for w, v in pen))
     st = solver.Solve(m)
 
-    # ==== 8. 교사 순서 정렬 및 굵은 테두리 엑셀 인쇄 설정 ====
+    # ==== 8. 결과 엑셀 출력 ====
     if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         out = {}
         for f in fixed_slots:
@@ -288,23 +308,9 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     if t_name not in out: out[t_name] = []
                     out[t_name].append({"subj": u["subj"], "cls": f"{u['grade']}-{u['cls']}", "slot": i})
         
-        # 선생님이 요청하신 과목별 나열 순서
-        custom_order = [
-            "김영순", "임희우", "김홍섭", "김승미", "오혜빈", "박은영", # 국어
-            "강수정", "김영혜", "김나영", # 역사, 사회
-            "황두환", "김효진", "정현미", "박수경", # 사회, 도덕
-            "서예슬", "박은경", "이상수", "김온유", "제현진", # 수학
-            "김재수", "전정화", "최나경", "허수정", "우가윤", # 과학
-            "오은정", "황현숙", "강영미", # 기가, 정보
-            "이연경", "오성환", "이준희", "김명규", # 체육
-            "류지영", "우지연", # 음악
-            "김진호", "이정빈", # 미술
-            "서정수", "이기영", "배미래", "박주현", "김미수", # 영어
-            "이아정", "임주헌", "김연지", "체육지원", "영어지원", "류명현"
-        ]
-        # 과목 경계선 (굵은 밑줄 그을 선생님)
-        group_ends = ["박은영", "김영혜", "김효진", "박수경", "제현진", "우가윤", "강영미", "김명규", "우지연", "이정빈"]
-        
+        # 교사 정렬 및 굵은 테두리 동적 파싱
+        custom_order = [x.strip() for x in user_conditions.get("sort_text", "").split(",") if x.strip()]
+        group_ends = [x.strip() for x in user_conditions.get("border_text", "").split(",") if x.strip()]
         sorted_teachers = sorted(out.keys(), key=lambda x: custom_order.index(x) if x in custom_order else 999)
                     
         wb = openpyxl.Workbook()
@@ -312,7 +318,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
         ws.title = "교사별 시간표"
         days_periods = [("월", 7), ("화", 6), ("수", 6), ("목", 7), ("금", 6)]
 
-        # 프린트(인쇄) 최적화 설정 추가
+        # 인쇄 영역 자동 설정 (A4 가로 1장 맞춤)
         ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
         ws.page_setup.fitToPage = True
         ws.page_setup.fitToWidth = 1
@@ -326,7 +332,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
         center = Alignment(horizontal="center", vertical="center", wrap_text=True)
         
         thin = Side(style="thin", color="000000")
-        thick = Side(style="medium", color="000000") # 굵은 테두리
+        thick = Side(style="medium", color="000000")
         bd_normal = Border(left=thin, right=thin, top=thin, bottom=thin)
         bd_thick_bottom = Border(left=thin, right=thin, top=thin, bottom=thick)
 
