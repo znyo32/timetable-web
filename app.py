@@ -14,6 +14,7 @@ st.sidebar.header("⚙️ 시간표 제약 조건 설정")
 # A. 기본 설정
 st.sidebar.subheader("1. 기본 규칙")
 max_consecutive = st.sidebar.slider("최대 허용 연속 수업 (연강)", min_value=1, max_value=4, value=2)
+target_1st_free = st.sidebar.slider("1교시 평균 공강 횟수 (주당)", min_value=0, max_value=5, value=2)
 apply_sports_rule = st.sidebar.checkbox("운동장 체육 2학급 이하 제한", value=True)
 
 # B. 금지 및 필수 조건 입력칸
@@ -51,7 +52,7 @@ default_pins = """[스포츠 고정]
 2-7(목4): 황두환, 김승미 / 2-8(목4): 제현진
 
 [지원강사 고정]
-체육지원: 화1, 화2, 화3, 화4
+류명현(체육지원): 화1, 화2, 화3, 화4
 영어지원: 월2, 월3, 금2, 금3
 이기영(지원): 금1, 금3, 금4"""
 pins_text = st.sidebar.text_area("📌 하드 고정 수업", value=default_pins, height=250)
@@ -70,6 +71,7 @@ if uploaded_excel is not None:
             
             user_conditions = {
                 "max_consecutive": max_consecutive,
+                "target_1st_free": target_1st_free,
                 "apply_sports_rule": apply_sports_rule
             }
             

@@ -7,7 +7,6 @@ from openpyxl.utils import get_column_letter
 from ortools.sat.python import cp_model
 
 def run_timetable_engine(uploaded_file, user_conditions):
-    # 시트 자동 탐색 (국어 시트 찾기)
     xls = pd.ExcelFile(uploaded_file)
     target_sheet = xls.sheet_names[0]
     for sheet in xls.sheet_names:
@@ -65,12 +64,14 @@ def run_timetable_engine(uploaded_file, user_conditions):
     # ==== 1. 기본 금지 조건 ====
     reserved = set()
     for i in match_slots(day="월", period=7):
-        for g, b in classes: reserved.add((g, b, i)) # 전학년 창체
+        for g, b in classes: reserved.add((g, b, i)) # 창체
 
     ban = defaultdict(set)
+    # 김연지 금지
     for i in match_slots(days=["월", "금"]): ban["김연지"].add(i)
     for i in match_slots(days=["화", "수", "목"], periods=[5,6,7]): ban["김연지"].add(i)
     
+    # 이기영(금5 반영), 김효진, 강영미, 김온유 금지
     for i in match_slots(day="월", period=1): ban["이기영"].add(i)
     for i in match_slots(day="목", period=1): ban["이기영"].add(i)
     for i in match_slots(day="금", period=5): ban["이기영"].add(i)
@@ -78,7 +79,8 @@ def run_timetable_engine(uploaded_file, user_conditions):
     for i in match_slots(days=["화", "수", "목"], period=3): ban["강영미"].add(i)
     for i in match_slots(day="화", period=6): ban["김온유"].add(i)
 
-    bujang = ["이기영","김영순","이준희","박수경","서정수","김진호","이연경","임주헌","전정화","김나영","배미래","오은정", "우지연"]
+    # 부장 명단 금6 공강 (우지연 제외)
+    bujang = ["이기영","김영순","이준희","박수경","서정수","김진호","이연경","임주헌","전정화","김나영","배미래","오은정"]
     for i in match_slots(day="금", period=6):
         for t in bujang: ban[t].add(i)
 
@@ -176,23 +178,17 @@ def run_timetable_engine(uploaded_file, user_conditions):
     # ==== 4-2. 3학년 미술 블록타임 및 일반과목 분산 ====
     for ci, u in enumerate(common_classes):
         is_art_block = (u["subj"] == "미술" and u["grade"] == 3 and u["teacher"] in ["김진호", "이정빈"])
-        
         if is_art_block and u["hours"] == 2:
             block_vars = []
             for d in DAYS:
                 for p in range(1, GRID[d]):
-                    if p == 4: continue # 4~5교시 점심시간을 가로지르는 연강 방지
+                    if p == 4: continue # 4~5교시 점심시간 가로지르기 방지
                     b_var = m.NewBoolVar(f"block_{ci}_{d}_{p}")
                     block_vars.append((b_var, sidx[(d, p)], sidx[(d, p+1)]))
-            
-            # 반드시 하나의 블록타임 패턴만 선택되도록 강제
             m.AddExactlyOne([bv[0] for bv in block_vars])
-            
-            # 선택된 블록타임 슬롯에 맞춰 실제 시간표(xc)를 연동
             for i in range(S):
                 m.Add(xc[(ci, i)] == sum(bv[0] for bv in block_vars if bv[1] == i or bv[2] == i))
         else:
-            # 일반 교과 수업은 하루에 최대 1시간 배정 (단, 주당 시수가 5 이하인 과목에 한해 엄격 적용)
             if u["hours"] <= 5:
                 for d in DAYS:
                     m.Add(sum(xc[(ci, i)] for i in match_slots(day=d)) <= 1)
@@ -206,9 +202,12 @@ def run_timetable_engine(uploaded_file, user_conditions):
     ljh = [ci for ci, u in enumerate(common_classes) if u["teacher"] == "이준희"]
     if ljh: m.Add(sum(xc[(ci, i)] for ci in ljh for i in match_slots(day="화", periods=[1,2,3,4])) >= 2)
 
-    # ==== 6. 3연강 금지 ====
+    # ==== 6. 3연강 금지 (지원강사 류명현 등은 고정표 상 제외) ====
     user_max_c = user_conditions.get("max_consecutive", 2)
     for t in teachers:
+        if t in ["류명현", "체육지원", "영어지원"]: 
+            continue # 이 분들은 고정표 자체가 4연강이므로 예외 처리
+            
         fixed_count = sum(1 for f in fixed_slots if f["teacher"] == t)
         total_t_hours = teacher_hours[t] + fixed_count
         max_c = user_max_c if total_t_hours <= 21 else 3
@@ -222,20 +221,22 @@ def run_timetable_engine(uploaded_file, user_conditions):
                         slot_vars.append(1 if is_fixed else tocc[(t, s_idx)])
                     m.Add(sum(slot_vars) <= max_c)
 
-    # ==== 7. 균등 배정 로직 ====
+    # ==== 7. 균등 배정 로직 (Soft Constraint) ====
     pen = []
     
-    # 1교시 공강 균등
+    # 1교시 공강 균등 (UI에서 입력받은 목표치 연동)
+    target_1st_free = user_conditions.get("target_1st_free", 2)
+    target_1st_work = 5 - target_1st_free
     for t in teachers:
         s_1 = sum(tocc[(t, i)] for i in match_slots(period=1))
         fixed_p1 = sum(1 for f in fixed_slots if f["teacher"] == t and slots[f["slot"]][1] == 1)
         diff = m.NewIntVar(-5, 5, "")
-        m.Add(diff == (s_1 + fixed_p1) - 3)
+        m.Add(diff == (s_1 + fixed_p1) - target_1st_work)
         abs_diff = m.NewIntVar(0, 5, "")
         m.AddAbsEquality(abs_diff, diff)
         pen.append((2, abs_diff))
 
-    # 요일별 시수 균등
+    # 요일별 시수 균등 배정 (일일 평균 시수 균등)
     for t in teachers:
         day_sums = []
         for d in DAYS:
@@ -270,7 +271,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
     balance_group(hr_3, 5)
     balance_group(hr_others, 2)
 
-    # 3학년 미술 오전/오후 균등 (블록타임이 한쪽으로 몰리지 않도록)
+    # 3학년 미술 오전/오후 균등 배정
     for t in ["김진호", "이정빈"]:
         cidx_3 = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t and u["subj"] == "미술" and u["grade"] == 3]
         if cidx_3:
@@ -288,7 +289,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
     m.Minimize(sum(w * v for w, v in pen))
     st = solver.Solve(m)
 
-    # ==== 8. 결과 출력 ====
+    # ==== 8. 공식 학교 엑셀 양식으로 변환 출력 ====
     if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         out = {}
         for f in fixed_slots:
