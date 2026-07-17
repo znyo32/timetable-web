@@ -6,31 +6,25 @@ from openpyxl.styles import Alignment, Font, Border, Side
 from openpyxl.utils import get_column_letter
 from ortools.sat.python import cp_model
 
-def run_timetable_engine(uploaded_file):
-    # --- [수정된 부분] 엑셀 시트 자동 탐색 (오류 방지) ---
+def run_timetable_engine(uploaded_file, user_conditions):
+    # 시트 자동 탐색 (국어 시트 찾기)
     xls = pd.ExcelFile(uploaded_file)
-    target_sheet = xls.sheet_names[0] # 기본값: 무조건 첫 번째 시트 읽기
-    
-    # 시트 이름 중 공백을 무시하고 '국어'가 포함된 시트를 찾음
+    target_sheet = xls.sheet_names[0]
     for sheet in xls.sheet_names:
         if '국어' in str(sheet).replace(" ", ""):
             target_sheet = sheet
             break
             
     df_kor = pd.read_excel(xls, sheet_name=target_sheet, header=None)
-    # -----------------------------------------------------
 
     common_classes = []
     seen = set()
-    
-    # 1. 시수표 파싱
     for i in range(4, len(df_kor)):
         subj = df_kor.iloc[i, 0]
         teacher = df_kor.iloc[i, 1]
         if pd.notna(teacher) and str(teacher).strip() not in ['담당교사', '담당', '교사', 'nan', '']:
             t_name = str(teacher).strip()
             subj_name = str(subj).strip()
-            
             for c_idx in range(2, 26):
                 val = df_kor.iloc[i, c_idx]
                 try:
@@ -38,7 +32,6 @@ def run_timetable_engine(uploaded_file):
                         if 2 <= c_idx <= 9: g, b = 1, c_idx - 1
                         elif 10 <= c_idx <= 17: g, b = 2, c_idx - 9
                         elif 18 <= c_idx <= 25: g, b = 3, c_idx - 17
-                        
                         key = (t_name, subj_name, g, b)
                         if key not in seen:
                             seen.add(key)
@@ -52,10 +45,8 @@ def run_timetable_engine(uploaded_file):
     classes = sorted(list(set((c["grade"], c["cls"]) for c in common_classes)))
 
     teacher_hours = defaultdict(int)
-    for c in common_classes: 
-        teacher_hours[c["teacher"]] += c["hours"]
+    for c in common_classes: teacher_hours[c["teacher"]] += c["hours"]
 
-    # 2. 격자 생성 (월7, 화6, 수6, 목7, 금6)
     GRID = {"월":7, "화":6, "수":6, "목":7, "금":6}
     DAYS = list(GRID.keys())
     slots = [(d, p) for d in DAYS for p in range(1, GRID[d] + 1)]
@@ -71,25 +62,27 @@ def run_timetable_engine(uploaded_file):
             out.append(i)
         return out
 
-    # 3. 제약 조건 설정
+    # ==== 1. 기본 금지 조건 ====
     reserved = set()
     for i in match_slots(day="월", period=7):
-        for g, b in classes: reserved.add((g, b, i))
+        for g, b in classes: reserved.add((g, b, i)) # 전학년 창체
 
     ban = defaultdict(set)
     for i in match_slots(days=["월", "금"]): ban["김연지"].add(i)
     for i in match_slots(days=["화", "수", "목"], periods=[5,6,7]): ban["김연지"].add(i)
+    
+    for i in match_slots(day="월", period=1): ban["이기영"].add(i)
+    for i in match_slots(day="목", period=1): ban["이기영"].add(i)
+    for i in match_slots(day="금", period=5): ban["이기영"].add(i)
+    for i in match_slots(period=1): ban["김효진"].add(i)
+    for i in match_slots(days=["화", "수", "목"], period=3): ban["강영미"].add(i)
+    for i in match_slots(day="화", period=6): ban["김온유"].add(i)
 
     bujang = ["이기영","김영순","이준희","박수경","서정수","김진호","이연경","임주헌","전정화","김나영","배미래","오은정", "우지연"]
     for i in match_slots(day="금", period=6):
         for t in bujang: ban[t].add(i)
 
-    for i in match_slots(day="월", period=1): ban["이기영"].add(i)
-    for i in match_slots(day="목", periods=[1, 7]): ban["이기영"].add(i)
-    for i in match_slots(period=1): ban["김효진"].add(i)
-    for i in match_slots(days=["화", "수", "목"], period=3): ban["강영미"].add(i)
-    for i in match_slots(day="화", period=6): ban["김온유"].add(i)
-
+    # ==== 2. 스포츠 및 지원강사 압핀 고정 ====
     fixed_slots = []
     sports_pins = {
         ("화", 2): [("김진호", (3,1)), ("서정수", (3,1)), ("류지영", (3,2)), ("제현진", (3,3))],
@@ -113,8 +106,8 @@ def run_timetable_engine(uploaded_file):
 
     for d, p in [("화", 1), ("화", 2), ("화", 3), ("화", 4)]:
         slot_idx = sidx[(d, p)]
-        ban["체육지원"].add(slot_idx)
-        fixed_slots.append({"teacher": "체육지원", "cls": None, "slot": slot_idx, "subj": "지원"})
+        ban["류명현"].add(slot_idx)
+        fixed_slots.append({"teacher": "류명현", "cls": None, "slot": slot_idx, "subj": "지원"})
     for d, p in [("월", 2), ("월", 3), ("금", 2), ("금", 3)]:
         slot_idx = sidx[(d, p)]
         ban["영어지원"].add(slot_idx)
@@ -135,6 +128,11 @@ def run_timetable_engine(uploaded_file):
             m.Add(o == sum(xc[(ci, i)] for ci in cidx))
             tocc[(t, i)] = o
         for i in range(S): m.Add(tocc[(t, i)] <= 1)
+
+    # ==== 3. 특별실 공유 (김연지-임주헌 엇갈리게 배정) ====
+    if "김연지" in teachers and "임주헌" in teachers:
+        for i in range(S):
+            m.Add(tocc[("김연지", i)] + tocc[("임주헌", i)] <= 1)
 
     for ci, u in enumerate(common_classes):
         g, b = u["grade"], u["cls"]; t = u["teacher"]
@@ -159,6 +157,47 @@ def run_timetable_engine(uploaded_file):
             for d in DAYS:
                 m.Add(sum(xc[(ci, i)] for ci in idxs for i in match_slots(day=d)) <= 1)
 
+    # ==== 4. 무용(이연경) 및 체육(운동장) 제약 ====
+    for ci, u in enumerate(common_classes):
+        if u["teacher"] == "이연경":
+            if u["grade"] == 3:
+                for i in match_slots(day="화"): m.Add(xc[(ci, i)] == 0)
+            elif u["grade"] == 2:
+                for i in match_slots(day="목"): m.Add(xc[(ci, i)] == 0)
+
+    if user_conditions.get("apply_sports_rule", True):
+        for i in sports_slot_indices:
+            pe_in_slot = []
+            for ci, u in enumerate(common_classes):
+                if "체육" in u["subj"] and "지원" not in u["subj"]:
+                    pe_in_slot.append(xc[(ci, i)])
+            m.Add(sum(pe_in_slot) <= 2)
+
+    # ==== 4-2. 3학년 미술 블록타임 및 일반과목 분산 ====
+    for ci, u in enumerate(common_classes):
+        is_art_block = (u["subj"] == "미술" and u["grade"] == 3 and u["teacher"] in ["김진호", "이정빈"])
+        
+        if is_art_block and u["hours"] == 2:
+            block_vars = []
+            for d in DAYS:
+                for p in range(1, GRID[d]):
+                    if p == 4: continue # 4~5교시 점심시간을 가로지르는 연강 방지
+                    b_var = m.NewBoolVar(f"block_{ci}_{d}_{p}")
+                    block_vars.append((b_var, sidx[(d, p)], sidx[(d, p+1)]))
+            
+            # 반드시 하나의 블록타임 패턴만 선택되도록 강제
+            m.AddExactlyOne([bv[0] for bv in block_vars])
+            
+            # 선택된 블록타임 슬롯에 맞춰 실제 시간표(xc)를 연동
+            for i in range(S):
+                m.Add(xc[(ci, i)] == sum(bv[0] for bv in block_vars if bv[1] == i or bv[2] == i))
+        else:
+            # 일반 교과 수업은 하루에 최대 1시간 배정 (단, 주당 시수가 5 이하인 과목에 한해 엄격 적용)
+            if u["hours"] <= 5:
+                for d in DAYS:
+                    m.Add(sum(xc[(ci, i)] for i in match_slots(day=d)) <= 1)
+
+    # ==== 5. 필수 배정 조건 ====
     pjh = [ci for ci, u in enumerate(common_classes) if u["teacher"] == "박주현"]
     if pjh:
         m.Add(sum(xc[(ci, i)] for ci in pjh for i in match_slots(day="월", periods=[2,3])) >= 1)
@@ -167,24 +206,12 @@ def run_timetable_engine(uploaded_file):
     ljh = [ci for ci, u in enumerate(common_classes) if u["teacher"] == "이준희"]
     if ljh: m.Add(sum(xc[(ci, i)] for ci in ljh for i in match_slots(day="화", periods=[1,2,3,4])) >= 2)
 
-    for ci, u in enumerate(common_classes):
-        if "체육" in u["subj"] or "무용" in u["subj"]:
-            if u["grade"] == 3:
-                for i in match_slots(day="화"): m.Add(xc[(ci, i)] == 0)
-            elif u["grade"] == 2:
-                for i in match_slots(day="목"): m.Add(xc[(ci, i)] == 0)
-
-    for i in sports_slot_indices:
-        pe_in_slot = []
-        for ci, u in enumerate(common_classes):
-            if "체육" in u["subj"] and "지원" not in u["subj"]:
-                pe_in_slot.append(xc[(ci, i)])
-        m.Add(sum(pe_in_slot) <= 2)
-
+    # ==== 6. 3연강 금지 ====
+    user_max_c = user_conditions.get("max_consecutive", 2)
     for t in teachers:
         fixed_count = sum(1 for f in fixed_slots if f["teacher"] == t)
         total_t_hours = teacher_hours[t] + fixed_count
-        max_c = 2 if total_t_hours <= 21 else 3
+        max_c = user_max_c if total_t_hours <= 21 else 3
         for d in DAYS:
             for p in range(1, GRID[d] + 1):
                 if all((d, p + k) in sidx for k in range(max_c + 1)):
@@ -195,7 +222,10 @@ def run_timetable_engine(uploaded_file):
                         slot_vars.append(1 if is_fixed else tocc[(t, s_idx)])
                     m.Add(sum(slot_vars) <= max_c)
 
+    # ==== 7. 균등 배정 로직 ====
     pen = []
+    
+    # 1교시 공강 균등
     for t in teachers:
         s_1 = sum(tocc[(t, i)] for i in match_slots(period=1))
         fixed_p1 = sum(1 for f in fixed_slots if f["teacher"] == t and slots[f["slot"]][1] == 1)
@@ -205,6 +235,7 @@ def run_timetable_engine(uploaded_file):
         m.AddAbsEquality(abs_diff, diff)
         pen.append((2, abs_diff))
 
+    # 요일별 시수 균등
     for t in teachers:
         day_sums = []
         for d in DAYS:
@@ -215,6 +246,7 @@ def run_timetable_engine(uploaded_file):
         m.AddMaxEquality(d_max, day_sums); m.AddMinEquality(d_min, day_sums)
         pen.append((10, d_max - d_min))
 
+    # 담임 그룹 3교시 공강 균등
     hr_1 = ["이아정","김홍섭","김나영","김온유","류지영","박주현","임희우","최나경"]
     hr_2 = ["우가윤","이상수","배미래","박은영","오성환","박은경","오혜빈","강수정"]
     hr_3 = ["우지연","김명규","오은정","서예슬","김영혜","이정빈","김승미","허수정"]
@@ -238,6 +270,7 @@ def run_timetable_engine(uploaded_file):
     balance_group(hr_3, 5)
     balance_group(hr_others, 2)
 
+    # 3학년 미술 오전/오후 균등 (블록타임이 한쪽으로 몰리지 않도록)
     for t in ["김진호", "이정빈"]:
         cidx_3 = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t and u["subj"] == "미술" and u["grade"] == 3]
         if cidx_3:
@@ -255,6 +288,7 @@ def run_timetable_engine(uploaded_file):
     m.Minimize(sum(w * v for w, v in pen))
     st = solver.Solve(m)
 
+    # ==== 8. 결과 출력 ====
     if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         out = {}
         for f in fixed_slots:
@@ -271,7 +305,6 @@ def run_timetable_engine(uploaded_file):
                     if t_name not in out: out[t_name] = []
                     out[t_name].append({"subj": u["subj"], "cls": f"{u['grade']}-{u['cls']}", "slot": i})
                     
-        # --- 엑셀 파일 생성 로직 ---
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "교사별 시간표"
@@ -285,40 +318,30 @@ def run_timetable_engine(uploaded_file):
         thin = Side(style="thin", color="000000")
         bd = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        ws.cell(1, 1, "2학기 전체교사 시간표(최종)").font = font_title1
-        ws.cell(2, 1, "2026 학년도").font = font_title2
-        ws.cell(2, sum([p for _, p in days_periods]) + 1, "현대청운중학교").font = font_title2
+        ws.cell(1, 1, "2026-2학기 전체교사 시간표 초안").font = font_title1
+        ws.cell(2, 1, "교사별 시간표").font = font_title2
 
         ws.cell(3, 1, "교사").font = font_bold
-        ws.cell(3, 1).alignment = center
-        ws.cell(3, 1).border = bd
-        ws.cell(4, 1, "").border = bd
+        ws.cell(3, 1).alignment = center; ws.cell(3, 1).border = bd; ws.cell(4, 1, "").border = bd
         ws.merge_cells("A3:A4")
 
         col = 2
         for day, periods in days_periods:
             ws.cell(3, col, day).font = font_bold
-            ws.cell(3, col).alignment = center
-            ws.cell(3, col).border = bd
+            ws.cell(3, col).alignment = center; ws.cell(3, col).border = bd
             ws.merge_cells(start_row=3, start_column=col, end_row=3, end_column=col+periods-1)
             for p in range(1, periods + 1):
                 c = ws.cell(4, col, str(p))
-                c.font = font_bold
-                c.alignment = center
-                c.border = bd
+                c.font = font_bold; c.alignment = center; c.border = bd
                 ws.cell(3, col).border = bd
                 col += 1
 
         ws.cell(3, col, "교사").font = font_bold
-        ws.cell(3, col).alignment = center
-        ws.cell(3, col).border = bd
-        ws.cell(4, col, "").border = bd
+        ws.cell(3, col).alignment = center; ws.cell(3, col).border = bd; ws.cell(4, col, "").border = bd
         ws.merge_cells(start_row=3, start_column=col, end_row=4, end_column=col)
 
-        ws.cell(3, col+1, "시수").font = font_bold
-        ws.cell(3, col+1).alignment = center
-        ws.cell(3, col+1).border = bd
-        ws.cell(4, col+1, "").border = bd
+        ws.cell(3, col+1, "계").font = font_bold
+        ws.cell(3, col+1).alignment = center; ws.cell(3, col+1).border = bd; ws.cell(4, col+1, "").border = bd
         ws.merge_cells(start_row=3, start_column=col+1, end_row=4, end_column=col+1)
         total_cols = col + 1
 
@@ -328,9 +351,7 @@ def run_timetable_engine(uploaded_file):
             slot_map = {item["slot"]: item for item in items}
             
             ws.cell(r, 1, t_name).font = font_base
-            ws.cell(r, 1).alignment = center
-            ws.cell(r, 1).border = bd
-            ws.cell(r+1, 1).border = bd
+            ws.cell(r, 1).alignment = center; ws.cell(r, 1).border = bd; ws.cell(r+1, 1).border = bd
             ws.merge_cells(start_row=r, start_column=1, end_row=r+1, end_column=1)
             
             col = 2
@@ -344,24 +365,18 @@ def run_timetable_engine(uploaded_file):
                     cls_str = ""
                     subj_str = ""
                     
-                c1 = ws.cell(r, col, cls_str)
-                c2 = ws.cell(r+1, col, subj_str)
+                c1 = ws.cell(r, col, cls_str); c2 = ws.cell(r+1, col, subj_str)
                 c1.font = font_base; c1.alignment = center; c1.border = bd
                 c2.font = font_base; c2.alignment = center; c2.border = bd
                 col += 1
                 
             ws.cell(r, col, t_name).font = font_base
-            ws.cell(r, col).alignment = center
-            ws.cell(r, col).border = bd
-            ws.cell(r+1, col).border = bd
+            ws.cell(r, col).alignment = center; ws.cell(r, col).border = bd; ws.cell(r+1, col).border = bd
             ws.merge_cells(start_row=r, start_column=col, end_row=r+1, end_column=col)
             
             ws.cell(r, col+1, count).font = font_base
-            ws.cell(r, col+1).alignment = center
-            ws.cell(r, col+1).border = bd
-            ws.cell(r+1, col+1).border = bd
+            ws.cell(r, col+1).alignment = center; ws.cell(r, col+1).border = bd; ws.cell(r+1, col+1).border = bd
             ws.merge_cells(start_row=r, start_column=col+1, end_row=r+1, end_column=col+1)
-            
             r += 2
 
         ws.column_dimensions["A"].width = 5.0
