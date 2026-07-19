@@ -35,26 +35,10 @@ def run_timetable_engine(uploaded_file, user_conditions):
         subj = df_kor.iloc[i, 0]
         teacher = df_kor.iloc[i, 1]
 
-        # 1. '합계', '소계' 등의 행은 이중 합산 방지를 위해 완전히 무시
-        if pd.notna(subj) and any(x in str(subj).replace(" ", "") for x in ['계', '합계', '소계']):
-            continue
-        if pd.notna(teacher) and any(x in str(teacher).replace(" ", "") for x in ['계', '합계', '소계']):
-            continue
-
-        # 2. 교사명 인식 (오지랖 버그 완벽 차단)
-        if pd.notna(teacher):
-            t_str = str(teacher).strip()
-            if t_str not in ['nan', '']:
-                # '담당', '강사', '미정' 등의 글자가 있으면 윗사람 이름 상속을 즉시 끊어버림!
-                if any(x in t_str for x in ['담당', '강사', '미정']) or t_str == '교사':
-                    current_teacher = None 
-                else:
-                    current_teacher = t_str
-
-        if pd.notna(subj):
-            s_str = str(subj).strip()
-            if s_str not in ['nan', '']:
-                current_subj = s_str
+        if pd.notna(teacher) and str(teacher).strip() not in ['담당교사', '담당', '교사', 'nan', '']:
+            current_teacher = str(teacher).strip()
+        if pd.notna(subj) and str(subj).strip() not in ['과목', '교과', 'nan', '']:
+            current_subj = str(subj).strip()
 
         if not current_teacher or not current_subj: 
             continue
@@ -82,8 +66,8 @@ def run_timetable_engine(uploaded_file, user_conditions):
     teachers = sorted(list(set(c["teacher"] for c in common_classes)))
     classes = sorted(list(set((c["grade"], c["cls"]) for c in common_classes)))
 
-    # 그리드는 시수 초과 에러 방지를 위해 넉넉히 7교시까지 오픈
-    GRID = {"월":7, "화":7, "수":7, "목":7, "금":7}
+    # [수정완료] 선생님 학교의 실제 일과 시간에 맞춰 완벽하게 픽스!
+    GRID = {"월":6, "화":6, "수":6, "목":7, "금":6}
     DAYS = list(GRID.keys())
     slots = [(d, p) for d in DAYS for p in range(1, GRID[d] + 1)]
     S = len(slots); sidx = {s: i for i, s in enumerate(slots)}
@@ -138,8 +122,6 @@ def run_timetable_engine(uploaded_file, user_conditions):
 
         ban = defaultdict(set)
         reserved = set()
-        for i in [sidx[(d, p)] for d, p in slots if d=="월" and p==7]:
-            for g, b in classes: reserved.add((g, b, i)) 
 
         for line in user_conditions.get("banned_text", "").split("\n"):
             if ":" in line:
@@ -262,7 +244,6 @@ def run_timetable_engine(uploaded_file, user_conditions):
                         if all((d, p+k) in sidx for k in range(3)):
                             m.Add(sum(xc[(ci, sidx[(d, p+k)])] for k in range(3)) <= 2)
 
-        # ==== 동적 자동 완화 적용 영역 ====
         if "특정 학년-요일 금지 (무용 등)" in attempt_hr or "특정 학년-요일 금지 (무용 등)" in base_soft_rules:
             for line in user_conditions.get("grade_day_text", "").split("\n"):
                 if ":" in line:
@@ -348,7 +329,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
         if "1교시 공강 1시간 필수" in attempt_hr or "1교시 공강 1시간 필수" in base_soft_rules:
             for t in teachers:
                 avail_1st = sum(1 for d in DAYS if (d, 1) in sidx and sidx[(d, 1)] not in ban[t])
-                target_1st_work = 5 - user_conditions.get("target_1st_free", 1) # 주당 1회 공강 보장
+                target_1st_work = 5 - user_conditions.get("target_1st_free", 1) 
                 if avail_1st >= target_1st_work: 
                     s_1 = sum(is_active(t, d, 1) for d in DAYS if (d, 1) in sidx)
                     if "1교시 공강 1시간 필수" in attempt_hr:
@@ -436,7 +417,8 @@ def run_timetable_engine(uploaded_file, user_conditions):
         ws = wb.active
         ws.title = "교사별 시간표"
         
-        days_periods = [("월", 7), ("화", 7), ("수", 7), ("목", 7), ("금", 7)]
+        # 실제 학교 교시 반영
+        days_periods = [("월", 6), ("화", 6), ("수", 6), ("목", 7), ("금", 6)]
 
         ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
         ws.page_setup.fitToPage = True
@@ -453,7 +435,6 @@ def run_timetable_engine(uploaded_file, user_conditions):
         thin = Side(style="thin", color="000000")
         thick = Side(style="medium", color="000000")
         bd_normal = Border(left=thin, right=thin, top=thin, bottom=thin)
-        bd_thick_bottom = Border(left=thin, right=thin, top=thin, bottom=thick)
 
         ws.cell(1, 1, "2026-2학기 전체교사 시간표 초안").font = font_title1
         ws.cell(2, 1, "교사별 시간표").font = font_title2
@@ -462,6 +443,8 @@ def run_timetable_engine(uploaded_file, user_conditions):
         ws.merge_cells("A3:A4")
 
         col = 2
+        thick_right_cols = [1]
+        curr_c = 1
         for day, periods in days_periods:
             ws.cell(3, col, day).font = font_bold
             ws.cell(3, col).alignment = center; ws.cell(3, col).border = bd_normal
@@ -471,6 +454,8 @@ def run_timetable_engine(uploaded_file, user_conditions):
                 c.font = font_bold; c.alignment = center; c.border = bd_normal
                 ws.cell(3, col).border = bd_normal
                 col += 1
+            curr_c += periods
+            thick_right_cols.append(curr_c)
 
         ws.cell(3, col, "교사").font = font_bold
         ws.cell(3, col).alignment = center; ws.cell(3, col).border = bd_normal; ws.cell(4, col, "").border = bd_normal
@@ -479,7 +464,10 @@ def run_timetable_engine(uploaded_file, user_conditions):
         ws.cell(3, col+1, "계").font = font_bold
         ws.cell(3, col+1).alignment = center; ws.cell(3, col+1).border = bd_normal; ws.cell(4, col+1, "").border = bd_normal
         ws.merge_cells(start_row=3, start_column=col+1, end_row=4, end_column=col+1)
+        
         total_cols = col + 1
+        thick_right_cols.extend([total_cols - 1, total_cols])
+        thick_bottom_rows = [4]
 
         r = 5
         for t_name in sorted_teachers:
@@ -487,10 +475,11 @@ def run_timetable_engine(uploaded_file, user_conditions):
             slot_map = {item["slot"]: item for item in items}
             
             is_group_end = t_name in group_ends
-            bottom_bd = bd_thick_bottom if is_group_end else bd_normal
+            if is_group_end:
+                thick_bottom_rows.append(r + 1)
             
             ws.cell(r, 1, t_name).font = font_base
-            ws.cell(r, 1).alignment = center; ws.cell(r, 1).border = bd_normal; ws.cell(r+1, 1).border = bottom_bd
+            ws.cell(r, 1).alignment = center; ws.cell(r, 1).border = bd_normal; ws.cell(r+1, 1).border = bd_normal
             ws.merge_cells(start_row=r, start_column=1, end_row=r+1, end_column=1)
             
             col = 2
@@ -506,17 +495,32 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     
                 c1 = ws.cell(r, col, cls_str); c2 = ws.cell(r+1, col, subj_str)
                 c1.font = font_base; c1.alignment = center; c1.border = bd_normal
-                c2.font = font_base; c2.alignment = center; c2.border = bottom_bd
+                c2.font = font_base; c2.alignment = center; c2.border = bd_normal
                 col += 1
                 
             ws.cell(r, col, t_name).font = font_base
-            ws.cell(r, col).alignment = center; ws.cell(r, col).border = bd_normal; ws.cell(r+1, col).border = bottom_bd
+            ws.cell(r, col).alignment = center; ws.cell(r, col).border = bd_normal; ws.cell(r+1, col).border = bd_normal
             ws.merge_cells(start_row=r, start_column=col, end_row=r+1, end_column=col)
             
             ws.cell(r, col+1, count).font = font_base
-            ws.cell(r, col+1).alignment = center; ws.cell(r, col+1).border = bd_normal; ws.cell(r+1, col+1).border = bottom_bd
+            ws.cell(r, col+1).alignment = center; ws.cell(r, col+1).border = bd_normal; ws.cell(r+1, col+1).border = bd_normal
             ws.merge_cells(start_row=r, start_column=col+1, end_row=r+1, end_column=col+1)
             r += 2
+
+        max_r = r - 1
+        thick_bottom_rows.append(max_r)
+        thick_bottom_rows = list(set(thick_bottom_rows))
+
+        for row_idx in range(3, max_r + 1):
+            for col_idx in range(1, total_cols + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                
+                t = thick if row_idx == 3 else thin
+                b = thick if row_idx in thick_bottom_rows else thin
+                l = thick if col_idx == 1 or (col_idx - 1) in thick_right_cols else thin
+                r_bd = thick if col_idx in thick_right_cols else thin
+                
+                cell.border = Border(top=t, bottom=b, left=l, right=r_bd)
 
         ws.column_dimensions["A"].width = 5.0
         for i in range(2, total_cols - 1):
