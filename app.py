@@ -4,7 +4,7 @@ from engine import run_timetable_engine
 st.set_page_config(page_title="학교 시간표 생성기", layout="wide")
 
 st.title("스마트 시간표 자동 생성 시스템")
-st.markdown("모든 조건을 껐다 켰다 할 수 있습니다. 엔진이 실패하면 스스로 차순위를 어겨가며 무조건 시간표를 완성합니다.")
+st.markdown("모든 조건을 껐다 켰다 할 수 있습니다. 엔진이 꽉 막히면 스스로 덜 중요한 조건을 어겨가며 무조건 시간표를 완성합니다.")
 
 if "custom_rules" not in st.session_state:
     st.session_state.custom_rules = []
@@ -27,7 +27,7 @@ with tab1:
     ]
     all_rules = base_rules + st.session_state.custom_rules
     
-    # 선생님 요청 반영: 3연강 금지와 1교시 공강만 우선 하드로 둡니다.
+    # 선생님 요청 반영: 3연강 금지와 1교시 공강만 하드로 둡니다.
     hard_rules = st.multiselect(
         "필수 조건 (하드 제약 - 1순위. 예외 없음)", 
         all_rules, 
@@ -39,11 +39,11 @@ with tab1:
     
     st.markdown("---")
     st.header("2. 교사별 세부 조건 (자유 추가 및 삭제)")
-    st.info("선생님께서 적어주신 이 조건들은 1순위 중의 1순위입니다. (단, 물리적으로 불가능할 경우 엔진이 마지막에 일부를 무시하고 엑셀을 뽑아냅니다.)")
+    st.info("선생님께서 적어주신 이 조건들은 1순위 중의 1순위입니다. (정말 불가능할 경우에만 비상 타협 모드가 발동됩니다.)")
     
     col1, col2 = st.columns(2)
     with col1:
-        # 과도했던 기본 금지조건 초기화 완료
+        # 이연경 선생님 등 불필요한 기본 설정 싹 초기화 완료
         default_banned = """이기영: 금2, 금5, 금6
 김효진: 월1, 화1, 수1, 목1, 금1
 김온유: 화6"""

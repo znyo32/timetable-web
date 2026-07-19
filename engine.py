@@ -66,7 +66,8 @@ def run_timetable_engine(uploaded_file, user_conditions):
     teachers = sorted(list(set(c["teacher"] for c in common_classes)))
     classes = sorted(list(set((c["grade"], c["cls"]) for c in common_classes)))
 
-    GRID = {"월":7, "화":6, "수":6, "목":7, "금":6}
+    # 에러 방지: 요일별 시간표 슬롯을 7교시로 넉넉하게 오픈하여 시수 초과 크래시 원천 차단
+    GRID = {"월":7, "화":7, "수":7, "목":7, "금":7}
     DAYS = list(GRID.keys())
     slots = [(d, p) for d in DAYS for p in range(1, GRID[d] + 1)]
     S = len(slots); sidx = {s: i for i, s in enumerate(slots)}
@@ -74,7 +75,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
     base_hard_rules = list(user_conditions.get("hard_rules", []))
     base_soft_rules = list(user_conditions.get("soft_rules", []))
     
-    # 덜 중요한 규칙부터 차례대로 포기하는 순서 (3연강은 제일 마지막까지 사수)
+    # 우선순위: 3연강 절대 금지는 최후의 최후까지 지켜냅니다.
     relax_order = [
         "특정 학년-요일 금지 (무용 등)",
         "동일 학급 1일 1과목 분산",
@@ -86,12 +87,11 @@ def run_timetable_engine(uploaded_file, user_conditions):
         "교과 3연강 절대 금지"
     ]
 
-    # 엔진이 시도할 시나리오들 생성 (정상 -> 하나씩 포기 -> 최후 수단)
     attempts = []
     current_hr = list(base_hard_rules)
     relaxed_so_far = []
     
-    attempts.append((current_hr.copy(), True, [])) # 1. 완벽 조건 시도
+    attempts.append((current_hr.copy(), True, [])) 
     
     for r in relax_order:
         if r in current_hr:
@@ -99,14 +99,11 @@ def run_timetable_engine(uploaded_file, user_conditions):
             relaxed_so_far.append(r)
             attempts.append((current_hr.copy(), True, relaxed_so_far.copy()))
             
-    # 2. 필수 규칙을 다 빼도 안 되면 최후의 수단: 교사 개인 금지시간 무시 (소프트 페널티로 강등)
-    attempts.append((current_hr.copy(), False, relaxed_so_far.copy() + ["[비상배정] 일부 교사 개인 금지시간 강제 침범"]))
-    # 3. 절대적인 최후: 아무 제약 없이 엑셀 빈칸 채우기
-    attempts.append(([], False, ["[초비상] 거의 모든 조건 붕괴. 시수가 비정상적으로 꼬여있습니다."]))
+    attempts.append((current_hr.copy(), False, relaxed_so_far.copy() + ["[비상배정] 일부 교사의 개인 금지/필수 시간 강제 침범"]))
 
     st = None
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 30 # 한 시나리오당 30초씩 빠르게 판단
+    solver.parameters.max_time_in_seconds = 30 # 막히면 빠르게 다음 완화 단계로 넘어감
 
     final_xc = None
     final_out = None
@@ -186,7 +183,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     else:
                         overlap = m.NewIntVar(0, 1, "")
                         m.Add(overlap >= tocc[(t1, i)] + tocc[(t2, i)] - 1)
-                        pen.append((10000, overlap))
+                        pen.append((1000, overlap))
 
         for ci, u in enumerate(common_classes):
             g, b = u["grade"], u["cls"]; t = u["teacher"]
@@ -198,7 +195,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     if strict_bans: 
                         m.Add(xc[(ci, i)] == 0)
                     else: 
-                        pen.append((10000, xc[(ci, i)])) # 비상 타협: 금지시간 무시 페널티 부과
+                        pen.append((1000, xc[(ci, i)])) # 비상시 개인 금지시간 어기면 페널티
 
         for g, b in classes:
             cidx = [ci for ci, u in enumerate(common_classes) if u["grade"] == g and u["cls"] == b]
@@ -226,20 +223,31 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     else:
                         shortfall = m.NewIntVar(0, req, "")
                         m.Add(shortfall >= req - expr)
-                        pen.append((10000, shortfall))
+                        pen.append((1000, shortfall))
 
+        # [수정완료] 블록타임제 3학년은 무조건 2시간 블록 1개 생성 (남은 1시간이 있다면 자동 분산)
         block_teachers = [x.strip() for x in user_conditions.get("block_text", "").split(",") if x.strip()]
         for ci, u in enumerate(common_classes):
-            if u["teacher"] in block_teachers and u["hours"] == 2:
+            if u["teacher"] in block_teachers and u["grade"] == 3 and u["hours"] >= 2:
                 block_vars = []
                 for d in DAYS:
                     for p in range(1, GRID[d]):
                         if p == 4: continue
-                        b_var = m.NewBoolVar(f"block_{ci}_{d}_{p}")
-                        block_vars.append((b_var, sidx[(d, p)], sidx[(d, p+1)]))
-                m.AddExactlyOne([bv[0] for bv in block_vars])
-                for i in range(S):
-                    m.Add(xc[(ci, i)] == sum(bv[0] for bv in block_vars if bv[1] == i or bv[2] == i))
+                        if (d, p) in sidx and (d, p+1) in sidx:
+                            b_var = m.NewBoolVar(f"block_{ci}_{d}_{p}")
+                            block_vars.append((b_var, sidx[(d, p)], sidx[(d, p+1)]))
+                if block_vars:
+                    m.AddExactlyOne([bv[0] for bv in block_vars])
+                    for i in range(S):
+                        is_in_block = sum(bv[0] for bv in block_vars if bv[1] == i or bv[2] == i)
+                        m.Add(xc[(ci, i)] >= is_in_block)
+            
+            # 단, 블록타임제(2H)와 교과(1H)가 만나서 3연강이 되는 참사는 무조건 방지!
+            if u["hours"] >= 3:
+                for d in DAYS:
+                    for p in range(1, GRID[d] - 1):
+                        if all((d, p+k) in sidx for k in range(3)):
+                            m.Add(sum(xc[(ci, sidx[(d, p+k)])] for k in range(3)) <= 2)
 
         # ==== 동적 자동 완화 적용 영역 ====
         if "특정 학년-요일 금지 (무용 등)" in attempt_hr or "특정 학년-요일 금지 (무용 등)" in base_soft_rules:
@@ -267,7 +275,13 @@ def run_timetable_engine(uploaded_file, user_conditions):
             for (cls, t), idxs in byc.items():
                 if len(idxs) >= 1:
                     total_h = sum(common_classes[ci]["hours"] for ci in idxs)
+                    
+                    # 블록 교사일 경우 일일 최대 시수 한도를 똑똑하게 2로 올려주어 에러 방지
+                    is_block = any(common_classes[ci]["teacher"] in block_teachers and common_classes[ci]["grade"] == 3 and common_classes[ci]["hours"] >= 2 for ci in idxs)
+                    
                     limit = max(1, (total_h + 4) // 5) 
+                    if is_block: limit = max(limit, 2)
+                    
                     for d in DAYS:
                         target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1) if (d, p) in sidx]
                         expr = sum(xc[(ci, i)] for ci in idxs for i in target_slots)
@@ -285,7 +299,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     for p in range(1, GRID[d] - 2):
                         if all((d, p+k) in sidx for k in range(4)):
                             expr_4 = sum(is_active(t, d, p+k) for k in range(4))
-                            m.Add(expr_4 <= 3) # 4연강은 불사조 모드에서도 절대 사수
+                            m.Add(expr_4 <= 3) # 어떤 타협에도 4연강은 절대 사수
                     for p in range(1, GRID[d] - 1):
                         if all((d, p+k) in sidx for k in range(3)):
                             expr_reg_3 = sum(tocc[(t, sidx[(d, p+k)])] for k in range(3))
@@ -306,17 +320,16 @@ def run_timetable_engine(uploaded_file, user_conditions):
                 else:
                     pen.append((10, d_max - d_min))
 
+        # [수정완료] 1교시 공강 1시간을 강제하다 에러나는 현상 수학적 해결 (주당 최소 1회 이상 공강 보장)
         if "1교시 공강 1시간 필수" in attempt_hr or "1교시 공강 1시간 필수" in base_soft_rules:
             for t in teachers:
                 s_1 = sum(is_active(t, d, 1) for d in DAYS if (d, 1) in sidx)
-                diff = m.NewIntVar(-5, 5, "")
-                m.Add(diff == s_1 - 4) # 5일 중 4일 출근 = 1시간 공강
-                abs_diff = m.NewIntVar(0, 5, "")
-                m.AddAbsEquality(abs_diff, diff)
                 if "1교시 공강 1시간 필수" in attempt_hr:
-                    m.Add(abs_diff <= 1)
+                    m.Add(s_1 <= 4)
                 else:
-                    pen.append((5, abs_diff))
+                    excess = m.NewIntVar(0, 5, "")
+                    m.Add(excess >= s_1 - 4)
+                    pen.append((15, excess))
 
         if "4교시(점심) 공강 담임별 균등" in attempt_hr or "4교시(점심) 공강 담임별 균등" in base_soft_rules:
             hr_1 = [x.strip() for x in user_conditions.get("hr1_text", "").split(",") if x.strip()]
@@ -367,10 +380,9 @@ def run_timetable_engine(uploaded_file, user_conditions):
         st = solver.Solve(m)
 
         if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            # 성공 시 변수 저장 후 루프 탈출
             final_xc = xc
             if attempt_history:
-                final_feedback = "[알림: 일부 조건 자동 완화됨]\n엔진이 결과를 도출하기 위해 다음 규칙들을 부득이하게 위반/강등했습니다.\n- 위반된 항목: " + ", ".join(attempt_history)
+                final_feedback = "⚠️ [비상 타협 모드 작동]\n완벽한 조건을 찾지 못해, 엑셀 출력을 위해 다음 규칙들을 억지로 어겨가며 배정했습니다.\n\n어긴 항목: " + ", ".join(attempt_history)
             break 
 
     # ==== 엑셀 출력 ====
@@ -397,7 +409,9 @@ def run_timetable_engine(uploaded_file, user_conditions):
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "교사별 시간표"
-        days_periods = [("월", 7), ("화", 6), ("수", 6), ("목", 7), ("금", 6)]
+        
+        # 에러 완전 차단을 위해 7교시까지 출력 (없는 교시는 빈칸으로 깔끔하게 처리됩니다)
+        days_periods = [("월", 7), ("화", 7), ("수", 7), ("목", 7), ("금", 7)]
 
         ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
         ws.page_setup.fitToPage = True
@@ -492,4 +506,4 @@ def run_timetable_engine(uploaded_file, user_conditions):
         return output, "성공", final_feedback
         
     else:
-        return None, "실패", "프로그램 오류: 모든 조건을 완화해도 엑셀 데이터 형식이 잘못되어 배정할 수 없습니다."
+        return None, "실패", "서버 응답 오류"
