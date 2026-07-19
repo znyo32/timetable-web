@@ -71,13 +71,13 @@ def run_timetable_engine(uploaded_file, user_conditions):
     slots = [(d, p) for d in DAYS for p in range(1, GRID[d] + 1)]
     S = len(slots); sidx = {s: i for i, s in enumerate(slots)}
 
-    # ==== 🚀 자동 완화(Auto-Relax) 시스템 도입 ====
     current_hard_rules = list(user_conditions.get("hard_rules", []))
     current_soft_rules = list(user_conditions.get("soft_rules", []))
     relaxed_history = []
     
-    # 덜 중요한 것부터 엔진이 스스로 포기할 순서 (선생님이 강조한 교과 3연강은 맨 마지막 최후의 보루)
     relax_order = [
+        "특정 학년-요일 금지 (무용 등)",
+        "동일 학급 1일 1과목 분산",
         "1일 수업 시수 균등 배정",
         "4교시(점심) 공강 담임별 균등",
         "1교시 공강 균등 배정",
@@ -101,7 +101,6 @@ def run_timetable_engine(uploaded_file, user_conditions):
                 tocc[(t, i)] = o
             for i in range(S): m.Add(tocc[(t, i)] <= 1)
 
-        # 1. 절대 금지 / 필수 제약 (타협 불가 영역)
         ban = defaultdict(set)
         reserved = set()
         for i in [sidx[(d, p)] for d, p in slots if d=="월" and p==7]:
@@ -150,6 +149,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
             if (d, p) not in sidx: return 0
             slot_i = sidx[(d, p)]
             is_fixed = 1 if any(f["teacher"] == t and f["slot"] == slot_i for f in fixed_slots) else 0
+            if t not in teachers: return is_fixed
             return tocc[(t, slot_i)] + is_fixed
 
         sp_teachers = [x.strip() for x in user_conditions.get("special_room_text", "").split(",") if x.strip()]
@@ -172,29 +172,6 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     m.Add(sum(xc[(ci, i)] for ci in cidx) == 0)
                 else:
                     m.Add(sum(xc[(ci, i)] for ci in cidx) <= 1)
-
-        byc = defaultdict(list)
-        for ci, u in enumerate(common_classes): byc[((u["grade"], u["cls"]), u["teacher"])].append(ci)
-        for (cls, t), idxs in byc.items():
-            if len(idxs) >= 2:
-                for d in DAYS:
-                    target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1)]
-                    m.Add(sum(xc[(ci, i)] for ci in idxs for i in target_slots) <= 1)
-
-        for line in user_conditions.get("grade_day_text", "").split("\n"):
-            if ":" in line:
-                t, rule_part = line.split(":", 1)
-                t = t.strip()
-                for rule in rule_part.split(","):
-                    if "-" in rule:
-                        g_str, day_str = rule.split("-", 1)
-                        try:
-                            g_val, day_str = int(g_str.strip()), day_str.strip()
-                            for ci, u in enumerate(common_classes):
-                                if u["teacher"] == t and u["grade"] == g_val:
-                                    target_slots = [sidx[(day_str, p)] for p in range(1, GRID[day_str] + 1) if (day_str, p) in sidx]
-                                    for i in target_slots: m.Add(xc[(ci, i)] == 0)
-                        except: pass
 
         for line in user_conditions.get("mandatory_text", "").split("\n"):
             if ":" in line and ">=" in line:
@@ -222,8 +199,48 @@ def run_timetable_engine(uploaded_file, user_conditions):
                 for i in range(S):
                     m.Add(xc[(ci, i)] == sum(bv[0] for bv in block_vars if bv[1] == i or bv[2] == i))
 
-        # 2. 동적 자동 완화 규칙 영역
+        # ==== 동적 자동 완화 규칙 영역 ====
         pen = []
+        
+        # [신규] 특정 학년-요일 금지 (무용 등)
+        if "특정 학년-요일 금지 (무용 등)" in current_hard_rules or "특정 학년-요일 금지 (무용 등)" in current_soft_rules:
+            for line in user_conditions.get("grade_day_text", "").split("\n"):
+                if ":" in line:
+                    t, rule_part = line.split(":", 1)
+                    t = t.strip()
+                    for rule in rule_part.split(","):
+                        if "-" in rule:
+                            g_str, day_str = rule.split("-", 1)
+                            try:
+                                g_val, day_str = int(g_str.strip()), day_str.strip()
+                                for ci, u in enumerate(common_classes):
+                                    if u["teacher"] == t and u["grade"] == g_val:
+                                        target_slots = [sidx[(day_str, p)] for p in range(1, GRID[day_str] + 1) if (day_str, p) in sidx]
+                                        if "특정 학년-요일 금지 (무용 등)" in current_hard_rules:
+                                            for i in target_slots: m.Add(xc[(ci, i)] == 0)
+                                        else:
+                                            for i in target_slots:
+                                                pen.append((30, xc[(ci, i)]))
+                            except: pass
+
+        # [오류수정] 1일 1과목 분산 규칙
+        if "동일 학급 1일 1과목 분산" in current_hard_rules or "동일 학급 1일 1과목 분산" in current_soft_rules:
+            byc = defaultdict(list)
+            for ci, u in enumerate(common_classes): byc[((u["grade"], u["cls"]), u["teacher"])].append(ci)
+            for (cls, t), idxs in byc.items():
+                if len(idxs) >= 1:
+                    total_h = sum(common_classes[ci]["hours"] for ci in idxs)
+                    limit = max(1, (total_h + 4) // 5) # 시수가 너무 많으면 1일 한도 수학적으로 늘림
+                    for d in DAYS:
+                        target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1) if (d, p) in sidx]
+                        expr = sum(xc[(ci, i)] for ci in idxs for i in target_slots)
+                        if "동일 학급 1일 1과목 분산" in current_hard_rules:
+                            m.Add(expr <= limit)
+                        else:
+                            excess = m.NewIntVar(0, 5, "")
+                            m.Add(excess >= expr - limit)
+                            pen.append((20, excess))
+
         if "교과 3연강 절대 금지" in current_hard_rules or "교과 3연강 절대 금지" in current_soft_rules:
             for t in teachers:
                 if t in support_teachers: continue 
@@ -231,7 +248,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     for p in range(1, GRID[d] - 2):
                         if all((d, p+k) in sidx for k in range(4)):
                             expr_4 = sum(is_active(t, d, p+k) for k in range(4))
-                            m.Add(expr_4 <= 3) # 4연강은 절대 사수
+                            m.Add(expr_4 <= 3) # 어떤 상황이든 4연강은 절대 사수
                     for p in range(1, GRID[d] - 1):
                         if all((d, p+k) in sidx for k in range(3)):
                             expr_reg_3 = sum(tocc[(t, sidx[(d, p+k)])] for k in range(3))
@@ -311,15 +328,12 @@ def run_timetable_engine(uploaded_file, user_conditions):
                         pen.append((20, abs_diff))
 
         m.Minimize(sum(w * v for w, v in pen))
-        
-        # 엔진이 해를 찾는데 투자하는 시간 (짧게 설정해서 막히면 빨리 포기하고 조건을 낮추도록 세팅)
         solver.parameters.max_time_in_seconds = 45 
         st = solver.Solve(m)
 
         if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            break # 엑셀 출력으로 탈출!
+            break 
         else:
-            # 해를 못 찾았을 경우 가장 덜 중요한 규칙 하나를 자동 완화하고 루프 재시작
             relaxed_something = False
             for rule in relax_order:
                 if rule in current_hard_rules:
@@ -331,7 +345,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     break 
             
             if not relaxed_something:
-                break # 자동 완화 규칙마저 바닥나면 100% 완전 실패
+                break 
 
     # ==== 엑셀 출력 ====
     if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -449,13 +463,12 @@ def run_timetable_engine(uploaded_file, user_conditions):
         wb.save(output)
         output.seek(0)
         
-        # 완화 내역을 화면에 띄워줄 피드백 작성
         feedback_msg = ""
         if relaxed_history:
-            feedback_msg = f"[자동 조건 완화 작동됨]\n교사별 금지/필수 시간 하드 제약을 100% 지켜내기 위해 엔진이 아래 규칙을 [차순위]로 자동 강등하여 완성했습니다.\n- 강등된 규칙: {', '.join(relaxed_history)}"
+            feedback_msg = f"[자동 조건 완화 작동됨]\n교사별 금지/필수 시간 등 하드 제약을 100% 지켜내기 위해, 엔진이 다음 규칙을 부득이하게 [차순위]로 자동 강등하여 완성했습니다.\n- 강등된 규칙: {', '.join(relaxed_history)}"
         
         return output, "성공", feedback_msg
         
     else:
-        fb = "[모든 자동 완화 시도 실패]\n선생님이 적어주신 교사별 '금지/필수 시간' 자체가 수학적으로 모순일 확률이 높습니다. 텍스트 칸에서 금지 시간을 더 줄여보세요."
+        fb = "[모든 자동 완화 시도 실패]\n선생님이 적어주신 교사별 '금지/필수 시간' 자체가 수학적으로 완전히 꼬여있을 확률이 높습니다. 금지 시간을 하나씩 지워보세요."
         return None, "실패", fb

@@ -15,18 +15,19 @@ with tab1:
     st.header("1. 우선순위 자동 배정 규칙 (클릭하여 이동)")
     st.info("팁: 아래 칸에 직접 글씨를 쓰고 [엔터]를 치면 새 항목이 추가됩니다. 항목의 'X'를 누르면 빠지고, 빈칸을 눌러 다시 넣을 수 있습니다.")
     
-    new_rule = st.text_input("➕ 여기에 새로운 규칙을 입력하고 [엔터]를 누르세요.")
+    new_rule = st.text_input("여기에 새로운 규칙을 입력하고 [엔터]를 누르세요.")
     if new_rule and new_rule not in st.session_state.custom_rules:
         st.session_state.custom_rules.append(new_rule)
     
     base_rules = [
         "교과 3연강 절대 금지", "운동장 체육 2학급 이하 제한", 
-        "1일 수업 시수 균등 배정", "1교시 공강 균등 배정", 
-        "4교시(점심) 공강 담임별 균등", "미술 블록 오전/오후 균등"
+        "동일 학급 1일 1과목 분산", "1일 수업 시수 균등 배정", 
+        "1교시 공강 균등 배정", "4교시(점심) 공강 담임별 균등", 
+        "미술 블록 오전/오후 균등", "특정 학년-요일 금지 (무용 등)"
     ]
     all_rules = base_rules + st.session_state.custom_rules
     
-    hard_rules = st.multiselect("필수 조건 (하드 제약 - 1순위. 예외 없음)", all_rules, default=["교과 3연강 절대 금지", "운동장 체육 2학급 이하 제한"] + st.session_state.custom_rules)
+    hard_rules = st.multiselect("필수 조건 (하드 제약 - 1순위. 예외 없음)", all_rules, default=["교과 3연강 절대 금지", "운동장 체육 2학급 이하 제한", "동일 학급 1일 1과목 분산"] + st.session_state.custom_rules)
     
     rem_rules = [r for r in all_rules if r not in hard_rules]
     soft_rules = st.multiselect("차순위 조건 (소프트 제약 - 2순위. 최대한 지킴)", rem_rules, default=rem_rules)
