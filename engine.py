@@ -29,10 +29,8 @@ def run_timetable_engine(uploaded_file, user_conditions):
     current_teacher = None
     current_subj = None
     
-    # 지원 강사 명단 가져오기 (엑셀 파싱에서 완전히 스킵하여 엔진 고장 방지)
     support_teachers = [x.strip() for x in user_conditions.get("support_text", "").split(",") if x.strip()]
 
-    # 빈칸(병합) 인식하여 누락 없이 100% 읽어오기
     for i in range(4, len(df_kor)):
         subj = df_kor.iloc[i, 0]
         teacher = df_kor.iloc[i, 1]
@@ -45,7 +43,6 @@ def run_timetable_engine(uploaded_file, user_conditions):
         if not current_teacher or not current_subj: 
             continue
 
-        # 체육지원 등 순수 지원강사는 엑셀 대신 UI의 고정압핀으로만 완벽 통제
         if current_teacher in support_teachers:
             continue
 
@@ -74,237 +71,269 @@ def run_timetable_engine(uploaded_file, user_conditions):
     slots = [(d, p) for d in DAYS for p in range(1, GRID[d] + 1)]
     S = len(slots); sidx = {s: i for i, s in enumerate(slots)}
 
-    ban = defaultdict(set)
-    reserved = set()
-    for i in [sidx[(d, p)] for d, p in slots if d=="월" and p==7]:
-        for g, b in classes: reserved.add((g, b, i)) 
-
-    for line in user_conditions.get("banned_text", "").split("\n"):
-        if ":" in line:
-            t, slots_part = line.split(":", 1)
-            t = t.strip()
-            for s in slots_part.split(","):
-                for d, p in parse_slots(s):
-                    if (d, p) in sidx: ban[t].add(sidx[(d, p)])
-
-    if user_conditions.get("opt_bujang_free", True):
-        bujang = [x.strip() for x in user_conditions.get("bujang_text", "").split(",") if x.strip()]
-        for t in bujang:
-            if ("금", 6) in sidx: ban[t].add(sidx[("금", 6)])
-
-    fixed_slots = []
-    sports_slot_indices = set()
-    for line in user_conditions.get("pins_text", "").split("\n"):
-        line = line.strip()
-        if not line or line.startswith("["): continue
-        for part in line.split("/"):
-            part = part.strip()
-            if "(" in part and "):" in part:
-                cls_part, rest = part.split("(", 1)
-                slot_part, teachers_part = rest.split("):", 1)
-                cls_part, slot_part = cls_part.strip(), slot_part.strip()
-                if len(slot_part) >= 2 and (slot_part[0], int(slot_part[1:])) in sidx:
-                    slot_i = sidx[(slot_part[0], int(slot_part[1:]))]
-                    if "-" in cls_part:
-                        sports_slot_indices.add(slot_i)
-                        g, b = map(int, cls_part.split("-"))
-                        cls_tuple = (g, b)
-                        subj_name = "스포츠"
-                    else:
-                        cls_tuple = None
-                        subj_name = "지원"
-                    for t in teachers_part.split(","):
-                        t = t.strip()
-                        ban[t].add(slot_i)
-                        fixed_slots.append({"teacher": t, "cls": cls_tuple, "slot": slot_i, "subj": subj_name})
-
-    m = cp_model.CpModel()
-    xc = {(ci, i): m.NewBoolVar(f"c{ci}_{i}") for ci in range(len(common_classes)) for i in range(S)}
-    tocc = {}
+    # ==== 🚀 자동 완화(Auto-Relax) 시스템 도입 ====
+    current_hard_rules = list(user_conditions.get("hard_rules", []))
+    current_soft_rules = list(user_conditions.get("soft_rules", []))
+    relaxed_history = []
     
-    for t in teachers:
-        cidx = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t]
-        for i in range(S):
-            o = m.NewBoolVar("")
-            m.Add(o == sum(xc[(ci, i)] for ci in cidx))
-            tocc[(t, i)] = o
-        for i in range(S): m.Add(tocc[(t, i)] <= 1)
+    # 덜 중요한 것부터 엔진이 스스로 포기할 순서 (선생님이 강조한 교과 3연강은 맨 마지막 최후의 보루)
+    relax_order = [
+        "1일 수업 시수 균등 배정",
+        "4교시(점심) 공강 담임별 균등",
+        "1교시 공강 균등 배정",
+        "미술 블록 오전/오후 균등",
+        "운동장 체육 2학급 이하 제한",
+        "교과 3연강 절대 금지"
+    ]
 
-    def is_active(t, d, p):
-        if (d, p) not in sidx: return 0
-        slot_i = sidx[(d, p)]
-        is_fixed = 1 if any(f["teacher"] == t and f["slot"] == slot_i for f in fixed_slots) else 0
-        return tocc[(t, slot_i)] + is_fixed
+    st = None
+    solver = cp_model.CpSolver()
 
-    sp_teachers = [x.strip() for x in user_conditions.get("special_room_text", "").split(",") if x.strip()]
-    if len(sp_teachers) >= 2:
-        t1, t2 = sp_teachers[0], sp_teachers[1]
-        if t1 in teachers and t2 in teachers:
-            for i in range(S): m.Add(tocc[(t1, i)] + tocc[(t2, i)] <= 1)
-
-    for ci, u in enumerate(common_classes):
-        g, b = u["grade"], u["cls"]; t = u["teacher"]
-        m.Add(sum(xc[(ci, i)] for i in range(S)) == u["hours"])
-        for i in range(S):
-            if (g, b, i) in reserved or i in ban[t]: m.Add(xc[(ci, i)] == 0)
-
-    for g, b in classes:
-        cidx = [ci for ci, u in enumerate(common_classes) if u["grade"] == g and u["cls"] == b]
-        for i in range(S):
-            sports_in_class_slot = any(f["cls"] == (g, b) and f["slot"] == i for f in fixed_slots)
-            if sports_in_class_slot:
-                m.Add(sum(xc[(ci, i)] for ci in cidx) == 0)
-            else:
-                m.Add(sum(xc[(ci, i)] for ci in cidx) <= 1)
-
-    byc = defaultdict(list)
-    for ci, u in enumerate(common_classes): byc[((u["grade"], u["cls"]), u["teacher"])].append(ci)
-    for (cls, t), idxs in byc.items():
-        if len(idxs) >= 2:
-            for d in DAYS:
-                target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1)]
-                m.Add(sum(xc[(ci, i)] for ci in idxs for i in target_slots) <= 1)
-
-    for line in user_conditions.get("grade_day_text", "").split("\n"):
-        if ":" in line:
-            t, rule_part = line.split(":", 1)
-            t = t.strip()
-            for rule in rule_part.split(","):
-                if "-" in rule:
-                    g_str, day_str = rule.split("-", 1)
-                    try:
-                        g_val, day_str = int(g_str.strip()), day_str.strip()
-                        for ci, u in enumerate(common_classes):
-                            if u["teacher"] == t and u["grade"] == g_val:
-                                target_slots = [sidx[(day_str, p)] for p in range(1, GRID[day_str] + 1) if (day_str, p) in sidx]
-                                for i in target_slots: m.Add(xc[(ci, i)] == 0)
-                    except: pass
-
-    for line in user_conditions.get("mandatory_text", "").split("\n"):
-        if ":" in line and ">=" in line:
-            left, req = line.rsplit(">=", 1)
-            t, slots_part = left.split(":", 1)
-            t, req = t.strip(), int(req.strip())
-            target_slots = []
-            for s in slots_part.split(","):
-                for d, p in parse_slots(s):
-                    if (d, p) in sidx: target_slots.append(sidx[(d, p)])
-            cidx_t = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t]
-            if cidx_t and target_slots:
-                m.Add(sum(xc[(ci, i)] for ci in cidx_t for i in target_slots) >= req)
-
-    block_teachers = [x.strip() for x in user_conditions.get("block_text", "").split(",") if x.strip()]
-    for ci, u in enumerate(common_classes):
-        if u["teacher"] in block_teachers and u["hours"] == 2:
-            block_vars = []
-            for d in DAYS:
-                for p in range(1, GRID[d]):
-                    if p == 4: continue
-                    b_var = m.NewBoolVar(f"block_{ci}_{d}_{p}")
-                    block_vars.append((b_var, sidx[(d, p)], sidx[(d, p+1)]))
-            m.AddExactlyOne([bv[0] for bv in block_vars])
+    while True:
+        m = cp_model.CpModel()
+        xc = {(ci, i): m.NewBoolVar(f"c{ci}_{i}") for ci in range(len(common_classes)) for i in range(S)}
+        tocc = {}
+        for t in teachers:
+            cidx = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t]
             for i in range(S):
-                m.Add(xc[(ci, i)] == sum(bv[0] for bv in block_vars if bv[1] == i or bv[2] == i))
+                o = m.NewBoolVar("")
+                m.Add(o == sum(xc[(ci, i)] for ci in cidx))
+                tocc[(t, i)] = o
+            for i in range(S): m.Add(tocc[(t, i)] <= 1)
 
-    pen = []
-    hard_rules = user_conditions.get("hard_rules", [])
-    soft_rules = user_conditions.get("soft_rules", [])
+        # 1. 절대 금지 / 필수 제약 (타협 불가 영역)
+        ban = defaultdict(set)
+        reserved = set()
+        for i in [sidx[(d, p)] for d, p in slots if d=="월" and p==7]:
+            for g, b in classes: reserved.add((g, b, i)) 
 
-    if "교과 3연강 절대 금지" in hard_rules or "교과 3연강 절대 금지" in soft_rules:
-        for t in teachers:
-            if t in support_teachers: continue 
-            for d in DAYS:
-                # 어떤 경우든 4연강 절대 방지
-                for p in range(1, GRID[d] - 2):
-                    if all((d, p+k) in sidx for k in range(4)):
-                        expr_4 = sum(is_active(t, d, p+k) for k in range(4))
-                        m.Add(expr_4 <= 3)
+        for line in user_conditions.get("banned_text", "").split("\n"):
+            if ":" in line:
+                t, slots_part = line.split(":", 1)
+                t = t.strip()
+                for s in slots_part.split(","):
+                    for d, p in parse_slots(s):
+                        if (d, p) in sidx: ban[t].add(sidx[(d, p)])
 
-                # 정규 교과끼리의 3연강 절대 방지
-                for p in range(1, GRID[d] - 1):
-                    if all((d, p+k) in sidx for k in range(3)):
-                        expr_reg_3 = sum(tocc[(t, sidx[(d, p+k)])] for k in range(3))
-                        if "교과 3연강 절대 금지" in hard_rules:
-                            m.Add(expr_reg_3 <= 2)
+        if user_conditions.get("opt_bujang_free", True):
+            bujang = [x.strip() for x in user_conditions.get("bujang_text", "").split(",") if x.strip()]
+            for t in bujang:
+                if ("금", 6) in sidx: ban[t].add(sidx[("금", 6)])
+
+        fixed_slots = []
+        sports_slot_indices = set()
+        for line in user_conditions.get("pins_text", "").split("\n"):
+            line = line.strip()
+            if not line or line.startswith("["): continue
+            for part in line.split("/"):
+                part = part.strip()
+                if "(" in part and "):" in part:
+                    cls_part, rest = part.split("(", 1)
+                    slot_part, teachers_part = rest.split("):", 1)
+                    cls_part, slot_part = cls_part.strip(), slot_part.strip()
+                    if len(slot_part) >= 2 and (slot_part[0], int(slot_part[1:])) in sidx:
+                        slot_i = sidx[(slot_part[0], int(slot_part[1:]))]
+                        if "-" in cls_part:
+                            sports_slot_indices.add(slot_i)
+                            g, b = map(int, cls_part.split("-"))
+                            cls_tuple = (g, b)
+                            subj_name = "스포츠"
                         else:
-                            excess = m.NewIntVar(0, 3, "")
-                            m.Add(excess >= expr_reg_3 - 2)
-                            pen.append((50, excess))
+                            cls_tuple = None
+                            subj_name = "지원"
+                        for t in teachers_part.split(","):
+                            t = t.strip()
+                            ban[t].add(slot_i)
+                            fixed_slots.append({"teacher": t, "cls": cls_tuple, "slot": slot_i, "subj": subj_name})
 
-    if "1일 수업 시수 균등 배정" in hard_rules or "1일 수업 시수 균등 배정" in soft_rules:
-        for t in teachers:
-            day_sums = [sum(is_active(t, d, p) for p in range(1, GRID[d]+1) if (d, p) in sidx) for d in DAYS]
-            d_max = m.NewIntVar(0, 7, ""); d_min = m.NewIntVar(0, 7, "")
-            m.AddMaxEquality(d_max, day_sums); m.AddMinEquality(d_min, day_sums)
-            if "1일 수업 시수 균등 배정" in hard_rules:
-                m.Add(d_max - d_min <= 2)
-            else:
-                pen.append((10, d_max - d_min))
+        def is_active(t, d, p):
+            if (d, p) not in sidx: return 0
+            slot_i = sidx[(d, p)]
+            is_fixed = 1 if any(f["teacher"] == t and f["slot"] == slot_i for f in fixed_slots) else 0
+            return tocc[(t, slot_i)] + is_fixed
 
-    if "1교시 공강 균등 배정" in hard_rules or "1교시 공강 균등 배정" in soft_rules:
-        target_1st_work = 5 - user_conditions.get("target_1st_free", 2)
-        for t in teachers:
-            s_1 = sum(is_active(t, d, 1) for d in DAYS if (d, 1) in sidx)
-            diff = m.NewIntVar(-5, 5, "")
-            m.Add(diff == s_1 - target_1st_work)
-            abs_diff = m.NewIntVar(0, 5, "")
-            m.AddAbsEquality(abs_diff, diff)
-            if "1교시 공강 균등 배정" in hard_rules:
-                m.Add(abs_diff <= 1)
-            else:
-                pen.append((5, abs_diff))
+        sp_teachers = [x.strip() for x in user_conditions.get("special_room_text", "").split(",") if x.strip()]
+        if len(sp_teachers) >= 2:
+            t1, t2 = sp_teachers[0], sp_teachers[1]
+            if t1 in teachers and t2 in teachers:
+                for i in range(S): m.Add(tocc[(t1, i)] + tocc[(t2, i)] <= 1)
 
-    if "4교시(점심) 공강 담임별 균등" in hard_rules or "4교시(점심) 공강 담임별 균등" in soft_rules:
-        hr_1 = [x.strip() for x in user_conditions.get("hr1_text", "").split(",") if x.strip()]
-        hr_2 = [x.strip() for x in user_conditions.get("hr2_text", "").split(",") if x.strip()]
-        hr_3 = [x.strip() for x in user_conditions.get("hr3_text", "").split(",") if x.strip()]
-        hr_others = [t for t in teachers if t not in set(hr_1 + hr_2 + hr_3)]
-        
-        for g_list in [hr_1, hr_2, hr_3, hr_others]:
-            valid_t = [t for t in g_list if t in teachers]
-            if not valid_t: continue
-            p4_sums = [sum(is_active(t, d, 4) for d in DAYS if (d, 4) in sidx) for t in valid_t]
-            g_max = m.NewIntVar(0, 5, ""); g_min = m.NewIntVar(0, 5, "")
-            m.AddMaxEquality(g_max, p4_sums); m.AddMinEquality(g_min, p4_sums)
-            if "4교시(점심) 공강 담임별 균등" in hard_rules:
-                m.Add(g_max - g_min <= 1)
-            else:
-                pen.append((5, g_max - g_min))
+        for ci, u in enumerate(common_classes):
+            g, b = u["grade"], u["cls"]; t = u["teacher"]
+            m.Add(sum(xc[(ci, i)] for i in range(S)) == u["hours"])
+            for i in range(S):
+                if (g, b, i) in reserved or i in ban[t]: m.Add(xc[(ci, i)] == 0)
 
-    if "운동장 체육 2학급 이하 제한" in hard_rules or "운동장 체육 2학급 이하 제한" in soft_rules:
-        for i in sports_slot_indices:
-            pe_in_slot = []
-            for ci, u in enumerate(common_classes):
-                if "체육" in u["subj"] and "지원" not in u["subj"]:
-                    pe_in_slot.append(xc[(ci, i)])
-            if "운동장 체육 2학급 이하 제한" in hard_rules:
-                m.Add(sum(pe_in_slot) <= 2)
-            else:
-                excess = m.NewIntVar(0, 10, "")
-                m.Add(excess >= sum(pe_in_slot) - 2)
-                pen.append((50, excess))
+        for g, b in classes:
+            cidx = [ci for ci, u in enumerate(common_classes) if u["grade"] == g and u["cls"] == b]
+            for i in range(S):
+                sports_in_class_slot = any(f["cls"] == (g, b) and f["slot"] == i for f in fixed_slots)
+                if sports_in_class_slot:
+                    m.Add(sum(xc[(ci, i)] for ci in cidx) == 0)
+                else:
+                    m.Add(sum(xc[(ci, i)] for ci in cidx) <= 1)
 
-    if "미술 블록 오전/오후 균등" in hard_rules or "미술 블록 오전/오후 균등" in soft_rules:
-        for t in block_teachers:
-            cidx_3 = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t and u["hours"] == 2]
-            if cidx_3:
-                am = sum(xc[(ci, sidx[(d, p)])] for ci in cidx_3 for d in DAYS for p in range(1, 5) if (d, p) in sidx)
-                pm = sum(xc[(ci, sidx[(d, p)])] for ci in cidx_3 for d in DAYS for p in range(5, 8) if (d, p) in sidx)
-                diff = m.NewIntVar(-10, 10, "")
-                m.Add(diff == am - pm)
-                abs_diff = m.NewIntVar(0, 10, "")
+        byc = defaultdict(list)
+        for ci, u in enumerate(common_classes): byc[((u["grade"], u["cls"]), u["teacher"])].append(ci)
+        for (cls, t), idxs in byc.items():
+            if len(idxs) >= 2:
+                for d in DAYS:
+                    target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1)]
+                    m.Add(sum(xc[(ci, i)] for ci in idxs for i in target_slots) <= 1)
+
+        for line in user_conditions.get("grade_day_text", "").split("\n"):
+            if ":" in line:
+                t, rule_part = line.split(":", 1)
+                t = t.strip()
+                for rule in rule_part.split(","):
+                    if "-" in rule:
+                        g_str, day_str = rule.split("-", 1)
+                        try:
+                            g_val, day_str = int(g_str.strip()), day_str.strip()
+                            for ci, u in enumerate(common_classes):
+                                if u["teacher"] == t and u["grade"] == g_val:
+                                    target_slots = [sidx[(day_str, p)] for p in range(1, GRID[day_str] + 1) if (day_str, p) in sidx]
+                                    for i in target_slots: m.Add(xc[(ci, i)] == 0)
+                        except: pass
+
+        for line in user_conditions.get("mandatory_text", "").split("\n"):
+            if ":" in line and ">=" in line:
+                left, req = line.rsplit(">=", 1)
+                t, slots_part = left.split(":", 1)
+                t, req = t.strip(), int(req.strip())
+                target_slots = []
+                for s in slots_part.split(","):
+                    for d, p in parse_slots(s):
+                        if (d, p) in sidx: target_slots.append(sidx[(d, p)])
+                cidx_t = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t]
+                if cidx_t and target_slots:
+                    m.Add(sum(xc[(ci, i)] for ci in cidx_t for i in target_slots) >= req)
+
+        block_teachers = [x.strip() for x in user_conditions.get("block_text", "").split(",") if x.strip()]
+        for ci, u in enumerate(common_classes):
+            if u["teacher"] in block_teachers and u["hours"] == 2:
+                block_vars = []
+                for d in DAYS:
+                    for p in range(1, GRID[d]):
+                        if p == 4: continue
+                        b_var = m.NewBoolVar(f"block_{ci}_{d}_{p}")
+                        block_vars.append((b_var, sidx[(d, p)], sidx[(d, p+1)]))
+                m.AddExactlyOne([bv[0] for bv in block_vars])
+                for i in range(S):
+                    m.Add(xc[(ci, i)] == sum(bv[0] for bv in block_vars if bv[1] == i or bv[2] == i))
+
+        # 2. 동적 자동 완화 규칙 영역
+        pen = []
+        if "교과 3연강 절대 금지" in current_hard_rules or "교과 3연강 절대 금지" in current_soft_rules:
+            for t in teachers:
+                if t in support_teachers: continue 
+                for d in DAYS:
+                    for p in range(1, GRID[d] - 2):
+                        if all((d, p+k) in sidx for k in range(4)):
+                            expr_4 = sum(is_active(t, d, p+k) for k in range(4))
+                            m.Add(expr_4 <= 3) # 4연강은 절대 사수
+                    for p in range(1, GRID[d] - 1):
+                        if all((d, p+k) in sidx for k in range(3)):
+                            expr_reg_3 = sum(tocc[(t, sidx[(d, p+k)])] for k in range(3))
+                            if "교과 3연강 절대 금지" in current_hard_rules:
+                                m.Add(expr_reg_3 <= 2)
+                            else:
+                                excess = m.NewIntVar(0, 3, "")
+                                m.Add(excess >= expr_reg_3 - 2)
+                                pen.append((50, excess))
+
+        if "1일 수업 시수 균등 배정" in current_hard_rules or "1일 수업 시수 균등 배정" in current_soft_rules:
+            for t in teachers:
+                day_sums = [sum(is_active(t, d, p) for p in range(1, GRID[d]+1) if (d, p) in sidx) for d in DAYS]
+                d_max = m.NewIntVar(0, 7, ""); d_min = m.NewIntVar(0, 7, "")
+                m.AddMaxEquality(d_max, day_sums); m.AddMinEquality(d_min, day_sums)
+                if "1일 수업 시수 균등 배정" in current_hard_rules:
+                    m.Add(d_max - d_min <= 2)
+                else:
+                    pen.append((10, d_max - d_min))
+
+        if "1교시 공강 균등 배정" in current_hard_rules or "1교시 공강 균등 배정" in current_soft_rules:
+            target_1st_work = 5 - user_conditions.get("target_1st_free", 2)
+            for t in teachers:
+                s_1 = sum(is_active(t, d, 1) for d in DAYS if (d, 1) in sidx)
+                diff = m.NewIntVar(-5, 5, "")
+                m.Add(diff == s_1 - target_1st_work)
+                abs_diff = m.NewIntVar(0, 5, "")
                 m.AddAbsEquality(abs_diff, diff)
-                if "미술 블록 오전/오후 균등" in hard_rules:
+                if "1교시 공강 균등 배정" in current_hard_rules:
                     m.Add(abs_diff <= 1)
                 else:
-                    pen.append((20, abs_diff))
+                    pen.append((5, abs_diff))
 
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 300 
-    solver.parameters.num_search_workers = 8
-    m.Minimize(sum(w * v for w, v in pen))
-    st = solver.Solve(m)
+        if "4교시(점심) 공강 담임별 균등" in current_hard_rules or "4교시(점심) 공강 담임별 균등" in current_soft_rules:
+            hr_1 = [x.strip() for x in user_conditions.get("hr1_text", "").split(",") if x.strip()]
+            hr_2 = [x.strip() for x in user_conditions.get("hr2_text", "").split(",") if x.strip()]
+            hr_3 = [x.strip() for x in user_conditions.get("hr3_text", "").split(",") if x.strip()]
+            hr_others = [t for t in teachers if t not in set(hr_1 + hr_2 + hr_3)]
+            
+            for g_list in [hr_1, hr_2, hr_3, hr_others]:
+                valid_t = [t for t in g_list if t in teachers]
+                if not valid_t: continue
+                p4_sums = [sum(is_active(t, d, 4) for d in DAYS if (d, 4) in sidx) for t in valid_t]
+                g_max = m.NewIntVar(0, 5, ""); g_min = m.NewIntVar(0, 5, "")
+                m.AddMaxEquality(g_max, p4_sums); m.AddMinEquality(g_min, p4_sums)
+                if "4교시(점심) 공강 담임별 균등" in current_hard_rules:
+                    m.Add(g_max - g_min <= 1)
+                else:
+                    pen.append((5, g_max - g_min))
 
+        if "운동장 체육 2학급 이하 제한" in current_hard_rules or "운동장 체육 2학급 이하 제한" in current_soft_rules:
+            for i in sports_slot_indices:
+                pe_in_slot = []
+                for ci, u in enumerate(common_classes):
+                    if "체육" in u["subj"] and "지원" not in u["subj"]:
+                        pe_in_slot.append(xc[(ci, i)])
+                if "운동장 체육 2학급 이하 제한" in current_hard_rules:
+                    m.Add(sum(pe_in_slot) <= 2)
+                else:
+                    excess = m.NewIntVar(0, 10, "")
+                    m.Add(excess >= sum(pe_in_slot) - 2)
+                    pen.append((50, excess))
+
+        if "미술 블록 오전/오후 균등" in current_hard_rules or "미술 블록 오전/오후 균등" in current_soft_rules:
+            for t in block_teachers:
+                cidx_3 = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t and u["hours"] == 2]
+                if cidx_3:
+                    am = sum(xc[(ci, sidx[(d, p)])] for ci in cidx_3 for d in DAYS for p in range(1, 5) if (d, p) in sidx)
+                    pm = sum(xc[(ci, sidx[(d, p)])] for ci in cidx_3 for d in DAYS for p in range(5, 8) if (d, p) in sidx)
+                    diff = m.NewIntVar(-10, 10, "")
+                    m.Add(diff == am - pm)
+                    abs_diff = m.NewIntVar(0, 10, "")
+                    m.AddAbsEquality(abs_diff, diff)
+                    if "미술 블록 오전/오후 균등" in current_hard_rules:
+                        m.Add(abs_diff <= 1)
+                    else:
+                        pen.append((20, abs_diff))
+
+        m.Minimize(sum(w * v for w, v in pen))
+        
+        # 엔진이 해를 찾는데 투자하는 시간 (짧게 설정해서 막히면 빨리 포기하고 조건을 낮추도록 세팅)
+        solver.parameters.max_time_in_seconds = 45 
+        st = solver.Solve(m)
+
+        if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            break # 엑셀 출력으로 탈출!
+        else:
+            # 해를 못 찾았을 경우 가장 덜 중요한 규칙 하나를 자동 완화하고 루프 재시작
+            relaxed_something = False
+            for rule in relax_order:
+                if rule in current_hard_rules:
+                    current_hard_rules.remove(rule)
+                    if rule not in current_soft_rules:
+                        current_soft_rules.append(rule)
+                    relaxed_history.append(rule)
+                    relaxed_something = True
+                    break 
+            
+            if not relaxed_something:
+                break # 자동 완화 규칙마저 바닥나면 100% 완전 실패
+
+    # ==== 엑셀 출력 ====
     if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         out = {}
         for f in fixed_slots:
@@ -419,14 +448,14 @@ def run_timetable_engine(uploaded_file, user_conditions):
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
-        return output, "성공", ""
+        
+        # 완화 내역을 화면에 띄워줄 피드백 작성
+        feedback_msg = ""
+        if relaxed_history:
+            feedback_msg = f"[자동 조건 완화 작동됨]\n교사별 금지/필수 시간 하드 제약을 100% 지켜내기 위해 엔진이 아래 규칙을 [차순위]로 자동 강등하여 완성했습니다.\n- 강등된 규칙: {', '.join(relaxed_history)}"
+        
+        return output, "성공", feedback_msg
+        
     else:
-        fb = "[AI 시간표 해결 추천 피드백]\n\n"
-        if "교과 3연강 절대 금지" in hard_rules:
-            fb += "1. '교과 3연강 절대 금지'를 차순위 상자로 이동해 보세요. (단, 4연강은 이동해도 절대 허용되지 않습니다)\n"
-        if "1일 수업 시수 균등 배정" in hard_rules:
-            fb += "2. '1일 수업 시수 균등 배정'을 필수로 두면 5일 분배가 불가능한 교과가 생깁니다. 가급적 '차순위'로 사용하세요.\n"
-        if "4교시(점심) 공강 담임별 균등" in hard_rules:
-            fb += "3. '4교시 점심 공강 균등'을 차순위로 옮겨 엔진에 여유를 주세요.\n"
-        fb += "4. '교사별 세부 조건'의 텍스트 입력칸에서 제약이 너무 많은 분의 금지 시간을 하나씩 지워보시면 배정이 훨씬 수월해집니다."
+        fb = "[모든 자동 완화 시도 실패]\n선생님이 적어주신 교사별 '금지/필수 시간' 자체가 수학적으로 모순일 확률이 높습니다. 텍스트 칸에서 금지 시간을 더 줄여보세요."
         return None, "실패", fb
