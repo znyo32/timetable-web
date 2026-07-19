@@ -202,7 +202,6 @@ def run_timetable_engine(uploaded_file, user_conditions):
         # ==== 동적 자동 완화 규칙 영역 ====
         pen = []
         
-        # [신규] 특정 학년-요일 금지 (무용 등)
         if "특정 학년-요일 금지 (무용 등)" in current_hard_rules or "특정 학년-요일 금지 (무용 등)" in current_soft_rules:
             for line in user_conditions.get("grade_day_text", "").split("\n"):
                 if ":" in line:
@@ -223,14 +222,25 @@ def run_timetable_engine(uploaded_file, user_conditions):
                                                 pen.append((30, xc[(ci, i)]))
                             except: pass
 
-        # [오류수정] 1일 1과목 분산 규칙
         if "동일 학급 1일 1과목 분산" in current_hard_rules or "동일 학급 1일 1과목 분산" in current_soft_rules:
             byc = defaultdict(list)
             for ci, u in enumerate(common_classes): byc[((u["grade"], u["cls"]), u["teacher"])].append(ci)
             for (cls, t), idxs in byc.items():
                 if len(idxs) >= 1:
                     total_h = sum(common_classes[ci]["hours"] for ci in idxs)
-                    limit = max(1, (total_h + 4) // 5) # 시수가 너무 많으면 1일 한도 수학적으로 늘림
+                    
+                    # 스마트 계산: 금지 요일을 제외하고 '실제 출근 가능한 날'이 며칠인지 계산
+                    available_days = 0
+                    for d in DAYS:
+                        for p in range(1, GRID[d] + 1):
+                            if (d, p) in sidx and sidx[(d, p)] not in ban[t]:
+                                available_days += 1
+                                break
+                    if available_days == 0: available_days = 1
+                    
+                    # 출근일이 너무 적으면 알아서 하루 최대 허용치를 늘려줌
+                    limit = max(1, (total_h + available_days - 1) // available_days)
+                    
                     for d in DAYS:
                         target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1) if (d, p) in sidx]
                         expr = sum(xc[(ci, i)] for ci in idxs for i in target_slots)
@@ -248,7 +258,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     for p in range(1, GRID[d] - 2):
                         if all((d, p+k) in sidx for k in range(4)):
                             expr_4 = sum(is_active(t, d, p+k) for k in range(4))
-                            m.Add(expr_4 <= 3) # 어떤 상황이든 4연강은 절대 사수
+                            m.Add(expr_4 <= 3)
                     for p in range(1, GRID[d] - 1):
                         if all((d, p+k) in sidx for k in range(3)):
                             expr_reg_3 = sum(tocc[(t, sidx[(d, p+k)])] for k in range(3))
@@ -261,26 +271,35 @@ def run_timetable_engine(uploaded_file, user_conditions):
 
         if "1일 수업 시수 균등 배정" in current_hard_rules or "1일 수업 시수 균등 배정" in current_soft_rules:
             for t in teachers:
-                day_sums = [sum(is_active(t, d, p) for p in range(1, GRID[d]+1) if (d, p) in sidx) for d in DAYS]
-                d_max = m.NewIntVar(0, 7, ""); d_min = m.NewIntVar(0, 7, "")
-                m.AddMaxEquality(d_max, day_sums); m.AddMinEquality(d_min, day_sums)
-                if "1일 수업 시수 균등 배정" in current_hard_rules:
-                    m.Add(d_max - d_min <= 2)
-                else:
-                    pen.append((10, d_max - d_min))
+                active_day_sums = []
+                for d in DAYS:
+                    # 출근 가능한 날짜의 시수만 비교
+                    can_teach = any(sidx[(d, p)] not in ban[t] for p in range(1, GRID[d]+1) if (d, p) in sidx)
+                    if can_teach:
+                        active_day_sums.append(sum(is_active(t, d, p) for p in range(1, GRID[d]+1) if (d, p) in sidx))
+                
+                if active_day_sums:
+                    d_max = m.NewIntVar(0, 7, ""); d_min = m.NewIntVar(0, 7, "")
+                    m.AddMaxEquality(d_max, active_day_sums); m.AddMinEquality(d_min, active_day_sums)
+                    if "1일 수업 시수 균등 배정" in current_hard_rules:
+                        m.Add(d_max - d_min <= 2)
+                    else:
+                        pen.append((10, d_max - d_min))
 
         if "1교시 공강 균등 배정" in current_hard_rules or "1교시 공강 균등 배정" in current_soft_rules:
             target_1st_work = 5 - user_conditions.get("target_1st_free", 2)
             for t in teachers:
-                s_1 = sum(is_active(t, d, 1) for d in DAYS if (d, 1) in sidx)
-                diff = m.NewIntVar(-5, 5, "")
-                m.Add(diff == s_1 - target_1st_work)
-                abs_diff = m.NewIntVar(0, 5, "")
-                m.AddAbsEquality(abs_diff, diff)
-                if "1교시 공강 균등 배정" in current_hard_rules:
-                    m.Add(abs_diff <= 1)
-                else:
-                    pen.append((5, abs_diff))
+                avail_1st = sum(1 for d in DAYS if (d, 1) in sidx and sidx[(d, 1)] not in ban[t])
+                if avail_1st >= target_1st_work: # 원천 금지된 사람은 에러 방지를 위해 제외
+                    s_1 = sum(is_active(t, d, 1) for d in DAYS if (d, 1) in sidx)
+                    diff = m.NewIntVar(-5, 5, "")
+                    m.Add(diff == s_1 - target_1st_work)
+                    abs_diff = m.NewIntVar(0, 5, "")
+                    m.AddAbsEquality(abs_diff, diff)
+                    if "1교시 공강 균등 배정" in current_hard_rules:
+                        m.Add(abs_diff <= 1)
+                    else:
+                        pen.append((5, abs_diff))
 
         if "4교시(점심) 공강 담임별 균등" in current_hard_rules or "4교시(점심) 공강 담임별 균등" in current_soft_rules:
             hr_1 = [x.strip() for x in user_conditions.get("hr1_text", "").split(",") if x.strip()]
@@ -328,7 +347,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
                         pen.append((20, abs_diff))
 
         m.Minimize(sum(w * v for w, v in pen))
-        solver.parameters.max_time_in_seconds = 45 
+        solver.parameters.max_time_in_seconds = 60 
         st = solver.Solve(m)
 
         if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -465,10 +484,10 @@ def run_timetable_engine(uploaded_file, user_conditions):
         
         feedback_msg = ""
         if relaxed_history:
-            feedback_msg = f"[자동 조건 완화 작동됨]\n교사별 금지/필수 시간 등 하드 제약을 100% 지켜내기 위해, 엔진이 다음 규칙을 부득이하게 [차순위]로 자동 강등하여 완성했습니다.\n- 강등된 규칙: {', '.join(relaxed_history)}"
+            feedback_msg = f"[자동 조건 완화 작동됨]\n교사별 금지 시간을 100% 지켜내기 위해 엔진이 아래 규칙을 [차순위]로 몰래 강등하여 완성했습니다.\n- 강등된 규칙: {', '.join(relaxed_history)}"
         
         return output, "성공", feedback_msg
         
     else:
-        fb = "[모든 자동 완화 시도 실패]\n선생님이 적어주신 교사별 '금지/필수 시간' 자체가 수학적으로 완전히 꼬여있을 확률이 높습니다. 금지 시간을 하나씩 지워보세요."
+        fb = "[모든 자동 완화 시도 실패]\n선생님이 적어주신 교사별 '금지 시간' 자체가 수학적으로 완전히 꼬여있을 확률이 높습니다. 금지 시간을 하나씩 지워보세요."
         return None, "실패", fb
