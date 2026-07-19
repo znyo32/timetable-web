@@ -4,7 +4,7 @@ from engine import run_timetable_engine
 st.set_page_config(page_title="학교 시간표 생성기", layout="wide")
 
 st.title("스마트 시간표 자동 생성 시스템")
-st.markdown("모든 조건을 껐다 켰다 할 수 있습니다. 깐깐한 조건부터 점차 완화해가며 최적의 시간표를 뽑아보세요.")
+st.markdown("모든 조건을 껐다 켰다 할 수 있습니다. 엔진이 실패하면 스스로 차순위를 어겨가며 무조건 시간표를 완성합니다.")
 
 if "custom_rules" not in st.session_state:
     st.session_state.custom_rules = []
@@ -13,7 +13,7 @@ tab1, tab2 = st.tabs(["1. 조건 및 규칙 설정 (메인)", "2. 교사 명단 
 
 with tab1:
     st.header("1. 우선순위 자동 배정 규칙 (클릭하여 이동)")
-    st.info("팁: 아래 칸에 직접 글씨를 쓰고 [엔터]를 치면 새 항목이 추가됩니다. 항목의 'X'를 누르면 빠지고, 빈칸을 눌러 다시 넣을 수 있습니다.")
+    st.info("팁: 엔진이 성공할 수 있도록 필수 조건은 최소한으로 두고 나머지는 차순위로 두는 것이 좋습니다.")
     
     new_rule = st.text_input("여기에 새로운 규칙을 입력하고 [엔터]를 누르세요.")
     if new_rule and new_rule not in st.session_state.custom_rules:
@@ -22,32 +22,34 @@ with tab1:
     base_rules = [
         "교과 3연강 절대 금지", "운동장 체육 2학급 이하 제한", 
         "동일 학급 1일 1과목 분산", "1일 수업 시수 균등 배정", 
-        "1교시 공강 균등 배정", "4교시(점심) 공강 담임별 균등", 
+        "1교시 공강 1시간 필수", "4교시(점심) 공강 담임별 균등", 
         "미술 블록 오전/오후 균등", "특정 학년-요일 금지 (무용 등)"
     ]
     all_rules = base_rules + st.session_state.custom_rules
     
-    hard_rules = st.multiselect("필수 조건 (하드 제약 - 1순위. 예외 없음)", all_rules, default=["교과 3연강 절대 금지", "운동장 체육 2학급 이하 제한", "동일 학급 1일 1과목 분산"] + st.session_state.custom_rules)
+    # 선생님 요청 반영: 3연강 금지와 1교시 공강만 우선 하드로 둡니다.
+    hard_rules = st.multiselect(
+        "필수 조건 (하드 제약 - 1순위. 예외 없음)", 
+        all_rules, 
+        default=["교과 3연강 절대 금지", "1교시 공강 1시간 필수"] + st.session_state.custom_rules
+    )
     
     rem_rules = [r for r in all_rules if r not in hard_rules]
     soft_rules = st.multiselect("차순위 조건 (소프트 제약 - 2순위. 최대한 지킴)", rem_rules, default=rem_rules)
     
-    target_1st_free = st.slider("[참고] 1교시 공강 목표 횟수 (주당)", min_value=0, max_value=5, value=2)
-
     st.markdown("---")
     st.header("2. 교사별 세부 조건 (자유 추가 및 삭제)")
-    st.info("여기에 텍스트로 적힌 조건들은 '최우선 하드 제약'으로 작동합니다. 항목을 직접 지우거나 새롭게 타이핑하여 추가하실 수 있습니다.")
+    st.info("선생님께서 적어주신 이 조건들은 1순위 중의 1순위입니다. (단, 물리적으로 불가능할 경우 엔진이 마지막에 일부를 무시하고 엑셀을 뽑아냅니다.)")
     
     col1, col2 = st.columns(2)
     with col1:
-        default_banned = """김연지: 월, 금, 화5, 화6, 화7, 수5, 수6, 수7, 목5, 목6, 목7
-이기영: 월1, 목1, 금2, 금5, 금6
+        # 과도했던 기본 금지조건 초기화 완료
+        default_banned = """이기영: 금2, 금5, 금6
 김효진: 월1, 화1, 수1, 목1, 금1
 김온유: 화6"""
         banned_text = st.text_area("특정 교시 금지 (이름: 요일교시...)", value=default_banned, height=130)
 
-        default_grade_day = "이연경: 2-목, 3-화"
-        grade_day_text = st.text_area("특정 학년-요일 금지 (무용 등)", value=default_grade_day, height=68)
+        grade_day_text = st.text_area("특정 학년-요일 금지 (예: 무용 등)", value="", height=68, placeholder="이연경: 2-목, 3-화")
 
         default_special = "김연지, 임주헌"
         special_room_text = st.text_area("특별실 동시간대 금지 (2명)", value=default_special, height=68)
@@ -55,10 +57,10 @@ with tab1:
     with col2:
         default_mandatory = """이준희: 화1, 화2, 화3, 화4 >= 2
 박주현: 월2, 월3 >= 1
-박주현: 금2, 금3 >= 1"""
+박주현: 금2, 금3 >= 1
+이기영: 금1, 금3, 금4 >= 3"""
         mandatory_text = st.text_area("필수 배정 (이름: 요일교시... >= 횟수)", value=default_mandatory, height=130)
 
-        # 제현진 선생님 오타 완벽 수정 완료!
         default_pins = """3-1(화2): 김진호, 서정수 / 3-2(화2): 류지영 / 3-3(화2): 제현진
 3-4(화3): 황두환, 김영순 / 3-5(화3): 김승미 / 3-6(화3): 이아정
 3-7(화4): 김재수, 김진호 / 3-8(화4): 류지영
@@ -96,11 +98,10 @@ uploaded_excel = st.file_uploader("전체 시수 취합 엑셀 (.xlsx)", type=["
 
 if uploaded_excel is not None:
     if st.button("시간표 생성 시작", use_container_width=True):
-        with st.spinner("AI가 수백만 개의 경우의 수를 탐색 중입니다. (진행률 표기는 어렵지만 1~3분 내로 완료됩니다)"):
+        with st.spinner("엔진이 작동 중입니다. 조건이 막히면 스스로 타협하여 무조건 결과를 도출합니다. (최대 1~3분 소요)"):
             
             user_conditions = {
                 "hard_rules": hard_rules, "soft_rules": soft_rules,
-                "target_1st_free": target_1st_free,
                 "banned_text": banned_text, "grade_day_text": grade_day_text, "special_room_text": special_room_text,
                 "mandatory_text": mandatory_text, "pins_text": pins_text,
                 "opt_bujang_free": opt_bujang_free,
@@ -111,9 +112,11 @@ if uploaded_excel is not None:
             
             excel_buffer, status, feedback = run_timetable_engine(uploaded_excel, user_conditions)
             
-            if status == "성공" and excel_buffer is not None:
-                st.success("모든 조건을 만족하는 미배정 0 시간표가 완성되었습니다!")
+            if status == "성공":
+                st.success("시간표 생성이 완료되었습니다!")
                 st.info("다운로드 후 엑셀에서 인쇄(Ctrl+P)를 누르시면 A4 한 장에 꽉 차게 맞춰집니다.")
+                if feedback:
+                    st.warning(feedback) # 엔진이 어떤 규칙을 무시했는지 화면에 크게 띄워줍니다.
                 st.balloons()
                 st.download_button(
                     label="인쇄 최적화 엑셀 시간표 다운로드",
@@ -122,5 +125,4 @@ if uploaded_excel is not None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
-                st.error("조건 충돌: 현재 조건들이 너무 빡빡하여 해를 찾지 못했습니다.")
-                st.warning(feedback)
+                st.error("치명적 오류: 엑셀 데이터 자체에 심각한 오류가 있습니다.")

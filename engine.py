@@ -71,25 +71,48 @@ def run_timetable_engine(uploaded_file, user_conditions):
     slots = [(d, p) for d in DAYS for p in range(1, GRID[d] + 1)]
     S = len(slots); sidx = {s: i for i, s in enumerate(slots)}
 
-    current_hard_rules = list(user_conditions.get("hard_rules", []))
-    current_soft_rules = list(user_conditions.get("soft_rules", []))
-    relaxed_history = []
+    base_hard_rules = list(user_conditions.get("hard_rules", []))
+    base_soft_rules = list(user_conditions.get("soft_rules", []))
     
+    # 덜 중요한 규칙부터 차례대로 포기하는 순서 (3연강은 제일 마지막까지 사수)
     relax_order = [
         "특정 학년-요일 금지 (무용 등)",
         "동일 학급 1일 1과목 분산",
         "1일 수업 시수 균등 배정",
         "4교시(점심) 공강 담임별 균등",
-        "1교시 공강 균등 배정",
+        "1교시 공강 1시간 필수",
         "미술 블록 오전/오후 균등",
         "운동장 체육 2학급 이하 제한",
         "교과 3연강 절대 금지"
     ]
 
+    # 엔진이 시도할 시나리오들 생성 (정상 -> 하나씩 포기 -> 최후 수단)
+    attempts = []
+    current_hr = list(base_hard_rules)
+    relaxed_so_far = []
+    
+    attempts.append((current_hr.copy(), True, [])) # 1. 완벽 조건 시도
+    
+    for r in relax_order:
+        if r in current_hr:
+            current_hr.remove(r)
+            relaxed_so_far.append(r)
+            attempts.append((current_hr.copy(), True, relaxed_so_far.copy()))
+            
+    # 2. 필수 규칙을 다 빼도 안 되면 최후의 수단: 교사 개인 금지시간 무시 (소프트 페널티로 강등)
+    attempts.append((current_hr.copy(), False, relaxed_so_far.copy() + ["[비상배정] 일부 교사 개인 금지시간 강제 침범"]))
+    # 3. 절대적인 최후: 아무 제약 없이 엑셀 빈칸 채우기
+    attempts.append(([], False, ["[초비상] 거의 모든 조건 붕괴. 시수가 비정상적으로 꼬여있습니다."]))
+
     st = None
     solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30 # 한 시나리오당 30초씩 빠르게 판단
 
-    while True:
+    final_xc = None
+    final_out = None
+    final_feedback = ""
+
+    for attempt_hr, strict_bans, attempt_history in attempts:
         m = cp_model.CpModel()
         xc = {(ci, i): m.NewBoolVar(f"c{ci}_{i}") for ci in range(len(common_classes)) for i in range(S)}
         tocc = {}
@@ -152,17 +175,30 @@ def run_timetable_engine(uploaded_file, user_conditions):
             if t not in teachers: return is_fixed
             return tocc[(t, slot_i)] + is_fixed
 
+        pen = []
+        
         sp_teachers = [x.strip() for x in user_conditions.get("special_room_text", "").split(",") if x.strip()]
         if len(sp_teachers) >= 2:
             t1, t2 = sp_teachers[0], sp_teachers[1]
             if t1 in teachers and t2 in teachers:
-                for i in range(S): m.Add(tocc[(t1, i)] + tocc[(t2, i)] <= 1)
+                for i in range(S):
+                    if strict_bans: m.Add(tocc[(t1, i)] + tocc[(t2, i)] <= 1)
+                    else:
+                        overlap = m.NewIntVar(0, 1, "")
+                        m.Add(overlap >= tocc[(t1, i)] + tocc[(t2, i)] - 1)
+                        pen.append((10000, overlap))
 
         for ci, u in enumerate(common_classes):
             g, b = u["grade"], u["cls"]; t = u["teacher"]
             m.Add(sum(xc[(ci, i)] for i in range(S)) == u["hours"])
             for i in range(S):
-                if (g, b, i) in reserved or i in ban[t]: m.Add(xc[(ci, i)] == 0)
+                if (g, b, i) in reserved: 
+                    m.Add(xc[(ci, i)] == 0)
+                elif i in ban[t]:
+                    if strict_bans: 
+                        m.Add(xc[(ci, i)] == 0)
+                    else: 
+                        pen.append((10000, xc[(ci, i)])) # 비상 타협: 금지시간 무시 페널티 부과
 
         for g, b in classes:
             cidx = [ci for ci, u in enumerate(common_classes) if u["grade"] == g and u["cls"] == b]
@@ -184,7 +220,13 @@ def run_timetable_engine(uploaded_file, user_conditions):
                         if (d, p) in sidx: target_slots.append(sidx[(d, p)])
                 cidx_t = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t]
                 if cidx_t and target_slots:
-                    m.Add(sum(xc[(ci, i)] for ci in cidx_t for i in target_slots) >= req)
+                    expr = sum(xc[(ci, i)] for ci in cidx_t for i in target_slots)
+                    if strict_bans:
+                        m.Add(expr >= req)
+                    else:
+                        shortfall = m.NewIntVar(0, req, "")
+                        m.Add(shortfall >= req - expr)
+                        pen.append((10000, shortfall))
 
         block_teachers = [x.strip() for x in user_conditions.get("block_text", "").split(",") if x.strip()]
         for ci, u in enumerate(common_classes):
@@ -199,10 +241,8 @@ def run_timetable_engine(uploaded_file, user_conditions):
                 for i in range(S):
                     m.Add(xc[(ci, i)] == sum(bv[0] for bv in block_vars if bv[1] == i or bv[2] == i))
 
-        # ==== 동적 자동 완화 규칙 영역 ====
-        pen = []
-        
-        if "특정 학년-요일 금지 (무용 등)" in current_hard_rules or "특정 학년-요일 금지 (무용 등)" in current_soft_rules:
+        # ==== 동적 자동 완화 적용 영역 ====
+        if "특정 학년-요일 금지 (무용 등)" in attempt_hr or "특정 학년-요일 금지 (무용 등)" in base_soft_rules:
             for line in user_conditions.get("grade_day_text", "").split("\n"):
                 if ":" in line:
                     t, rule_part = line.split(":", 1)
@@ -215,93 +255,70 @@ def run_timetable_engine(uploaded_file, user_conditions):
                                 for ci, u in enumerate(common_classes):
                                     if u["teacher"] == t and u["grade"] == g_val:
                                         target_slots = [sidx[(day_str, p)] for p in range(1, GRID[day_str] + 1) if (day_str, p) in sidx]
-                                        if "특정 학년-요일 금지 (무용 등)" in current_hard_rules:
+                                        if "특정 학년-요일 금지 (무용 등)" in attempt_hr:
                                             for i in target_slots: m.Add(xc[(ci, i)] == 0)
                                         else:
-                                            for i in target_slots:
-                                                pen.append((30, xc[(ci, i)]))
+                                            for i in target_slots: pen.append((30, xc[(ci, i)]))
                             except: pass
 
-        if "동일 학급 1일 1과목 분산" in current_hard_rules or "동일 학급 1일 1과목 분산" in current_soft_rules:
+        if "동일 학급 1일 1과목 분산" in attempt_hr or "동일 학급 1일 1과목 분산" in base_soft_rules:
             byc = defaultdict(list)
             for ci, u in enumerate(common_classes): byc[((u["grade"], u["cls"]), u["teacher"])].append(ci)
             for (cls, t), idxs in byc.items():
                 if len(idxs) >= 1:
                     total_h = sum(common_classes[ci]["hours"] for ci in idxs)
-                    
-                    # 스마트 계산: 금지 요일을 제외하고 '실제 출근 가능한 날'이 며칠인지 계산
-                    available_days = 0
-                    for d in DAYS:
-                        for p in range(1, GRID[d] + 1):
-                            if (d, p) in sidx and sidx[(d, p)] not in ban[t]:
-                                available_days += 1
-                                break
-                    if available_days == 0: available_days = 1
-                    
-                    # 출근일이 너무 적으면 알아서 하루 최대 허용치를 늘려줌
-                    limit = max(1, (total_h + available_days - 1) // available_days)
-                    
+                    limit = max(1, (total_h + 4) // 5) 
                     for d in DAYS:
                         target_slots = [sidx[(d, p)] for p in range(1, GRID[d] + 1) if (d, p) in sidx]
                         expr = sum(xc[(ci, i)] for ci in idxs for i in target_slots)
-                        if "동일 학급 1일 1과목 분산" in current_hard_rules:
+                        if "동일 학급 1일 1과목 분산" in attempt_hr:
                             m.Add(expr <= limit)
                         else:
                             excess = m.NewIntVar(0, 5, "")
                             m.Add(excess >= expr - limit)
                             pen.append((20, excess))
 
-        if "교과 3연강 절대 금지" in current_hard_rules or "교과 3연강 절대 금지" in current_soft_rules:
+        if "교과 3연강 절대 금지" in attempt_hr or "교과 3연강 절대 금지" in base_soft_rules:
             for t in teachers:
                 if t in support_teachers: continue 
                 for d in DAYS:
                     for p in range(1, GRID[d] - 2):
                         if all((d, p+k) in sidx for k in range(4)):
                             expr_4 = sum(is_active(t, d, p+k) for k in range(4))
-                            m.Add(expr_4 <= 3)
+                            m.Add(expr_4 <= 3) # 4연강은 불사조 모드에서도 절대 사수
                     for p in range(1, GRID[d] - 1):
                         if all((d, p+k) in sidx for k in range(3)):
                             expr_reg_3 = sum(tocc[(t, sidx[(d, p+k)])] for k in range(3))
-                            if "교과 3연강 절대 금지" in current_hard_rules:
+                            if "교과 3연강 절대 금지" in attempt_hr:
                                 m.Add(expr_reg_3 <= 2)
                             else:
                                 excess = m.NewIntVar(0, 3, "")
                                 m.Add(excess >= expr_reg_3 - 2)
                                 pen.append((50, excess))
 
-        if "1일 수업 시수 균등 배정" in current_hard_rules or "1일 수업 시수 균등 배정" in current_soft_rules:
+        if "1일 수업 시수 균등 배정" in attempt_hr or "1일 수업 시수 균등 배정" in base_soft_rules:
             for t in teachers:
-                active_day_sums = []
-                for d in DAYS:
-                    # 출근 가능한 날짜의 시수만 비교
-                    can_teach = any(sidx[(d, p)] not in ban[t] for p in range(1, GRID[d]+1) if (d, p) in sidx)
-                    if can_teach:
-                        active_day_sums.append(sum(is_active(t, d, p) for p in range(1, GRID[d]+1) if (d, p) in sidx))
-                
-                if active_day_sums:
-                    d_max = m.NewIntVar(0, 7, ""); d_min = m.NewIntVar(0, 7, "")
-                    m.AddMaxEquality(d_max, active_day_sums); m.AddMinEquality(d_min, active_day_sums)
-                    if "1일 수업 시수 균등 배정" in current_hard_rules:
-                        m.Add(d_max - d_min <= 2)
-                    else:
-                        pen.append((10, d_max - d_min))
+                day_sums = [sum(is_active(t, d, p) for p in range(1, GRID[d]+1) if (d, p) in sidx) for d in DAYS]
+                d_max = m.NewIntVar(0, 7, ""); d_min = m.NewIntVar(0, 7, "")
+                m.AddMaxEquality(d_max, day_sums); m.AddMinEquality(d_min, day_sums)
+                if "1일 수업 시수 균등 배정" in attempt_hr:
+                    m.Add(d_max - d_min <= 2)
+                else:
+                    pen.append((10, d_max - d_min))
 
-        if "1교시 공강 균등 배정" in current_hard_rules or "1교시 공강 균등 배정" in current_soft_rules:
-            target_1st_work = 5 - user_conditions.get("target_1st_free", 2)
+        if "1교시 공강 1시간 필수" in attempt_hr or "1교시 공강 1시간 필수" in base_soft_rules:
             for t in teachers:
-                avail_1st = sum(1 for d in DAYS if (d, 1) in sidx and sidx[(d, 1)] not in ban[t])
-                if avail_1st >= target_1st_work: # 원천 금지된 사람은 에러 방지를 위해 제외
-                    s_1 = sum(is_active(t, d, 1) for d in DAYS if (d, 1) in sidx)
-                    diff = m.NewIntVar(-5, 5, "")
-                    m.Add(diff == s_1 - target_1st_work)
-                    abs_diff = m.NewIntVar(0, 5, "")
-                    m.AddAbsEquality(abs_diff, diff)
-                    if "1교시 공강 균등 배정" in current_hard_rules:
-                        m.Add(abs_diff <= 1)
-                    else:
-                        pen.append((5, abs_diff))
+                s_1 = sum(is_active(t, d, 1) for d in DAYS if (d, 1) in sidx)
+                diff = m.NewIntVar(-5, 5, "")
+                m.Add(diff == s_1 - 4) # 5일 중 4일 출근 = 1시간 공강
+                abs_diff = m.NewIntVar(0, 5, "")
+                m.AddAbsEquality(abs_diff, diff)
+                if "1교시 공강 1시간 필수" in attempt_hr:
+                    m.Add(abs_diff <= 1)
+                else:
+                    pen.append((5, abs_diff))
 
-        if "4교시(점심) 공강 담임별 균등" in current_hard_rules or "4교시(점심) 공강 담임별 균등" in current_soft_rules:
+        if "4교시(점심) 공강 담임별 균등" in attempt_hr or "4교시(점심) 공강 담임별 균등" in base_soft_rules:
             hr_1 = [x.strip() for x in user_conditions.get("hr1_text", "").split(",") if x.strip()]
             hr_2 = [x.strip() for x in user_conditions.get("hr2_text", "").split(",") if x.strip()]
             hr_3 = [x.strip() for x in user_conditions.get("hr3_text", "").split(",") if x.strip()]
@@ -313,25 +330,25 @@ def run_timetable_engine(uploaded_file, user_conditions):
                 p4_sums = [sum(is_active(t, d, 4) for d in DAYS if (d, 4) in sidx) for t in valid_t]
                 g_max = m.NewIntVar(0, 5, ""); g_min = m.NewIntVar(0, 5, "")
                 m.AddMaxEquality(g_max, p4_sums); m.AddMinEquality(g_min, p4_sums)
-                if "4교시(점심) 공강 담임별 균등" in current_hard_rules:
+                if "4교시(점심) 공강 담임별 균등" in attempt_hr:
                     m.Add(g_max - g_min <= 1)
                 else:
                     pen.append((5, g_max - g_min))
 
-        if "운동장 체육 2학급 이하 제한" in current_hard_rules or "운동장 체육 2학급 이하 제한" in current_soft_rules:
+        if "운동장 체육 2학급 이하 제한" in attempt_hr or "운동장 체육 2학급 이하 제한" in base_soft_rules:
             for i in sports_slot_indices:
                 pe_in_slot = []
                 for ci, u in enumerate(common_classes):
                     if "체육" in u["subj"] and "지원" not in u["subj"]:
                         pe_in_slot.append(xc[(ci, i)])
-                if "운동장 체육 2학급 이하 제한" in current_hard_rules:
+                if "운동장 체육 2학급 이하 제한" in attempt_hr:
                     m.Add(sum(pe_in_slot) <= 2)
                 else:
                     excess = m.NewIntVar(0, 10, "")
                     m.Add(excess >= sum(pe_in_slot) - 2)
                     pen.append((50, excess))
 
-        if "미술 블록 오전/오후 균등" in current_hard_rules or "미술 블록 오전/오후 균등" in current_soft_rules:
+        if "미술 블록 오전/오후 균등" in attempt_hr or "미술 블록 오전/오후 균등" in base_soft_rules:
             for t in block_teachers:
                 cidx_3 = [ci for ci, u in enumerate(common_classes) if u["teacher"] == t and u["hours"] == 2]
                 if cidx_3:
@@ -341,33 +358,23 @@ def run_timetable_engine(uploaded_file, user_conditions):
                     m.Add(diff == am - pm)
                     abs_diff = m.NewIntVar(0, 10, "")
                     m.AddAbsEquality(abs_diff, diff)
-                    if "미술 블록 오전/오후 균등" in current_hard_rules:
+                    if "미술 블록 오전/오후 균등" in attempt_hr:
                         m.Add(abs_diff <= 1)
                     else:
                         pen.append((20, abs_diff))
 
         m.Minimize(sum(w * v for w, v in pen))
-        solver.parameters.max_time_in_seconds = 60 
         st = solver.Solve(m)
 
         if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            # 성공 시 변수 저장 후 루프 탈출
+            final_xc = xc
+            if attempt_history:
+                final_feedback = "[알림: 일부 조건 자동 완화됨]\n엔진이 결과를 도출하기 위해 다음 규칙들을 부득이하게 위반/강등했습니다.\n- 위반된 항목: " + ", ".join(attempt_history)
             break 
-        else:
-            relaxed_something = False
-            for rule in relax_order:
-                if rule in current_hard_rules:
-                    current_hard_rules.remove(rule)
-                    if rule not in current_soft_rules:
-                        current_soft_rules.append(rule)
-                    relaxed_history.append(rule)
-                    relaxed_something = True
-                    break 
-            
-            if not relaxed_something:
-                break 
 
     # ==== 엑셀 출력 ====
-    if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+    if final_xc is not None:
         out = {}
         for f in fixed_slots:
             t_name = f["teacher"]
@@ -378,7 +385,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
         
         for ci, u in enumerate(common_classes):
             for i in range(S):
-                if solver.Value(xc[(ci, i)]):
+                if solver.Value(final_xc[(ci, i)]):
                     t_name = u["teacher"]
                     if t_name not in out: out[t_name] = []
                     out[t_name].append({"subj": u["subj"], "cls": f"{u['grade']}-{u['cls']}", "slot": i})
@@ -482,12 +489,7 @@ def run_timetable_engine(uploaded_file, user_conditions):
         wb.save(output)
         output.seek(0)
         
-        feedback_msg = ""
-        if relaxed_history:
-            feedback_msg = f"[자동 조건 완화 작동됨]\n교사별 금지 시간을 100% 지켜내기 위해 엔진이 아래 규칙을 [차순위]로 몰래 강등하여 완성했습니다.\n- 강등된 규칙: {', '.join(relaxed_history)}"
-        
-        return output, "성공", feedback_msg
+        return output, "성공", final_feedback
         
     else:
-        fb = "[모든 자동 완화 시도 실패]\n선생님이 적어주신 교사별 '금지 시간' 자체가 수학적으로 완전히 꼬여있을 확률이 높습니다. 금지 시간을 하나씩 지워보세요."
-        return None, "실패", fb
+        return None, "실패", "프로그램 오류: 모든 조건을 완화해도 엑셀 데이터 형식이 잘못되어 배정할 수 없습니다."
